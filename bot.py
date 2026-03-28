@@ -53,6 +53,24 @@ trade_client  = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
 crypto_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 stock_client  = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
+def normalize_df(df):
+    """Flatten multi-index and normalize column names."""
+    if df is None or df.empty:
+        return None
+    # Flatten MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
+    # Flatten MultiIndex rows (symbol-level)
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index(level=0, drop=True)
+    # Lowercase column names
+    df.columns = [c.lower() for c in df.columns]
+    df = df.reset_index(drop=True)
+    required = ['open', 'high', 'low', 'close', 'volume']
+    if not all(c in df.columns for c in required):
+        return None
+    return df[required]
+
 # -- Helpers --
 def get_portfolio_value():
     acct = trade_client.get_account()
@@ -66,11 +84,9 @@ def get_daily_pnl_pct():
 
 def get_crypto_bars(symbol: str, limit: int = 100):
     try:
-        req  = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=limit)
-        df   = crypto_client.get_crypto_bars(req).df
-        if hasattr(df.index, 'levels'):
-            df = df.droplevel(0)
-        return df[['open','high','low','close','volume']].reset_index(drop=True)
+        req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=limit)
+        raw = crypto_client.get_crypto_bars(req).df
+        return normalize_df(raw)
     except Exception as e:
         log.error(f'get_crypto_bars({symbol}): {e}')
         return None
@@ -78,10 +94,8 @@ def get_crypto_bars(symbol: str, limit: int = 100):
 def get_stock_bars(symbol: str, limit: int = 100):
     try:
         req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=limit)
-        df  = stock_client.get_stock_bars(req).df
-        if hasattr(df.index, 'levels'):
-            df = df.droplevel(0)
-        return df[['open','high','low','close','volume']].reset_index(drop=True)
+        raw = stock_client.get_stock_bars(req).df
+        return normalize_df(raw)
     except Exception as e:
         log.error(f'get_stock_bars({symbol}): {e}')
         return None
@@ -153,10 +167,10 @@ def check_stop_losses():
 
 def trade_symbol(symbol: str, is_crypto: bool, portfolio: float):
     bars = get_crypto_bars(symbol) if is_crypto else get_stock_bars(symbol)
-    signal, conf = compute_signals(bars)
-    qty_held = get_position_qty(symbol)
     if bars is None or len(bars) == 0:
         return
+    signal, conf = compute_signals(bars)
+    qty_held = get_position_qty(symbol)
     price = bars['close'].iloc[-1]
     max_qty = (portfolio * MAX_POSITION_PCT) / price
     if signal == 1 and qty_held <= 0 and conf >= 0.5:
