@@ -23,12 +23,16 @@ PAPER = os.environ.get('ALPACA_PAPER', 'true').lower() == 'true'
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-DAILY_PROFIT_TARGET = 0.01
-STOP_LOSS_PCT = 0.005
-TRAILING_STOP_PCT = 0.003
-MAX_POSITION_PCT = 0.20
-TRADE_INTERVAL = 120
+# AGGRESSIVE CONFIG - v3
+DAILY_PROFIT_TARGET = 0.03
+STOP_LOSS_PCT = 0.015
+TRAILING_STOP_PCT = 0.008
+MAX_POSITION_PCT = 0.40
+TRADE_INTERVAL = 60
 INTEL_INTERVAL = 300
+MIN_CONFIDENCE = 0.15
+MIN_SIGNAL_SCORE = 1
+FORCE_ENTRY_AFTER_CYCLES = 5
 
 CRYPTO_SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 STOCK_SYMBOLS = ['SPY', 'QQQ', 'TQQQ']
@@ -55,6 +59,7 @@ stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 intel_cache = {}
 last_intel_time = 0
 trailing_highs = {}
+idle_cycles = 0
 
 def normalize_df(df):
     if df is None or df.empty:
@@ -92,15 +97,15 @@ def get_bars(symbol, is_crypto=True, tf=TimeFrame.Minute, limit=100):
         return None
 
 def compute_signals(bars):
-    if bars is None or len(bars) < 50:
+    if bars is None or len(bars) < 30:
         return 0, 0.0, {}
     close = bars['close']
     rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
     macd_obj = MACD(close)
     macd_line = macd_obj.macd().iloc[-1]
     macd_sig = macd_obj.macd_signal().iloc[-1]
-    ema20 = EMAIndicator(close, window=20).ema_indicator().iloc[-1]
-    ema50 = EMAIndicator(close, window=50).ema_indicator().iloc[-1]
+    ema9 = EMAIndicator(close, window=9).ema_indicator().iloc[-1]
+    ema21 = EMAIndicator(close, window=21).ema_indicator().iloc[-1]
     bb = BollingerBands(close, window=20)
     bb_lo = bb.bollinger_lband().iloc[-1]
     bb_hi = bb.bollinger_hband().iloc[-1]
@@ -108,29 +113,34 @@ def compute_signals(bars):
     price = close.iloc[-1]
     volatility = atr / price if price > 0 else 0
     score = 0
-    details = {'rsi': rsi, 'macd_bull': macd_line > macd_sig, 'ema_bull': ema20 > ema50, 'price': price, 'volatility': volatility}
-    if rsi < 35: score += 1
-    elif rsi > 65: score -= 1
+    details = {'rsi': rsi, 'macd_bull': macd_line > macd_sig, 'ema_bull': ema9 > ema21, 'price': price, 'volatility': volatility}
+    # Aggressive RSI thresholds
+    if rsi < 45: score += 1
+    elif rsi > 60: score -= 1
+    if rsi < 30: score += 1  # Extra point for oversold
     if macd_line > macd_sig: score += 1
     else: score -= 1
-    if ema20 > ema50: score += 1
+    if ema9 > ema21: score += 1
     else: score -= 1
     if price < bb_lo: score += 1
     elif price > bb_hi: score -= 1
-    confidence = abs(score) / 4.0
-    signal = 1 if score >= 2 else (-1 if score <= -2 else 0)
+    # Momentum: price above recent average
+    avg5 = close.tail(5).mean()
+    if price > avg5: score += 1
+    confidence = min(abs(score) / 5.0, 1.0)
+    signal = 1 if score >= MIN_SIGNAL_SCORE else (-1 if score <= -2 else 0)
     return signal, confidence, details
 
 def multi_tf_signal(symbol, is_crypto):
     sig1, conf1, d1 = compute_signals(get_bars(symbol, is_crypto, TimeFrame.Minute, 100))
-    sig15, conf15, d15 = compute_signals(get_bars(symbol, is_crypto, TimeFrame.Minute, 100))
     sig_h, conf_h, dh = compute_signals(get_bars(symbol, is_crypto, TimeFrame.Hour, 100))
-    agree = sum([1 for s in [sig1, sig15, sig_h] if s == 1])
-    disagree = sum([1 for s in [sig1, sig15, sig_h] if s == -1])
-    if agree >= 2:
-        return 1, (conf1 + conf15 + conf_h) / 3.0, d1
-    elif disagree >= 2:
-        return -1, (conf1 + conf15 + conf_h) / 3.0, d1
+    # Only need 1 timeframe to agree for aggressive mode
+    if sig1 == 1 or sig_h == 1:
+        return 1, max(conf1, conf_h), d1 if d1.get('price', 0) > 0 else dh
+    elif sig1 == -1 and sig_h == -1:
+        return -1, max(conf1, conf_h), d1
+    elif sig1 == -1 or sig_h == -1:
+        return 0, (conf1 + conf_h) / 2.0, d1
     return 0, 0.0, d1
 
 def get_position_qty(symbol):
@@ -160,7 +170,6 @@ def check_trailing_stops():
         for pos in positions:
             sym = pos.symbol
             current = float(pos.current_price)
-            avg_entry = float(pos.avg_entry_price)
             pnl_pct = float(pos.unrealized_plpc)
             if pnl_pct <= -STOP_LOSS_PCT:
                 log.warning(f'STOP-LOSS {sym}: {pnl_pct:.2%}')
@@ -172,8 +181,8 @@ def check_trailing_stops():
                 trailing_highs[sym] = current
             if current > trailing_highs[sym]:
                 trailing_highs[sym] = current
-            drop_from_high = (trailing_highs[sym] - current) / trailing_highs[sym]
-            if pnl_pct > 0.002 and drop_from_high > TRAILING_STOP_PCT:
+            drop_from_high = (trailing_highs[sym] - current) / trailing_highs[sym] if trailing_highs[sym] > 0 else 0
+            if pnl_pct > 0.005 and drop_from_high > TRAILING_STOP_PCT:
                 log.info(f'TRAILING STOP {sym}: drop={drop_from_high:.2%} from high={trailing_highs[sym]:.2f}')
                 send_telegram(f'<b>TRAILING STOP</b> {sym}: locked profit, drop from high={drop_from_high:.2%}')
                 trade_client.close_position(sym)
@@ -197,24 +206,40 @@ def refresh_intelligence():
     fng = intel_cache.get('BTC/USD', {}).get('fng', 50)
     send_telegram(f'<b>INTEL UPDATE</b>\nFear&Greed: {fng}\n' + '\n'.join([f"{s}: score={intel_cache[s]['score']}" for s in CRYPTO_SYMBOLS if s in intel_cache]))
 
+def find_best_opportunity():
+    """Scan all symbols and find the best one to enter."""
+    best = None
+    best_score = -999
+    for sym in CRYPTO_SYMBOLS:
+        bars = get_bars(sym, True)
+        if bars is None or len(bars) < 30:
+            continue
+        sig, conf, details = multi_tf_signal(sym, True)
+        intel = intel_cache.get(sym, {'confidence': 0, 'score': 0})
+        combined = (conf * 0.7) + (max(0, intel.get('confidence', 0)) * 0.3)
+        total_score = sig * combined
+        log.info(f'SCAN {sym}: signal={sig} conf={conf:.2f} intel={intel.get("score",0)} combined={combined:.2f}')
+        if total_score > best_score:
+            best_score = total_score
+            best = {'symbol': sym, 'is_crypto': True, 'signal': sig, 'confidence': combined, 'details': details, 'intel': intel}
+    return best
+
 def trade_symbol(symbol, is_crypto, portfolio):
     bars = get_bars(symbol, is_crypto)
     if bars is None or len(bars) == 0:
-        return
+        return False
     signal, ta_conf, details = multi_tf_signal(symbol, is_crypto)
     intel = intel_cache.get(symbol, {'confidence': 0, 'score': 0, 'reasons': []})
     intel_conf = intel.get('confidence', 0)
-    combined = (ta_conf * 0.6) + (max(0, intel_conf) * 0.4)
+    combined = (ta_conf * 0.7) + (max(0, intel_conf) * 0.3)
     qty_held = get_position_qty(symbol)
     price = details.get('price', 0)
     if price == 0:
-        return
+        return False
     max_qty = (portfolio * MAX_POSITION_PCT) / price
-    if signal == 1 and qty_held <= 0 and combined >= 0.4:
-        if intel.get('score', 0) <= -2:
-            log.info(f'SKIP BUY {symbol}: intel too bearish (score={intel["score"]})')
-            return
-        qty = max_qty * combined
+    traded = False
+    if signal == 1 and qty_held <= 0 and combined >= MIN_CONFIDENCE:
+        qty = max_qty * max(combined, 0.5)
         if qty * price >= 1.0:
             order = place_order(symbol, OrderSide.BUY, qty)
             if order:
@@ -222,41 +247,92 @@ def trade_symbol(symbol, is_crypto, portfolio):
                 rsi = details.get('rsi', 0)
                 msg = (f'<b>BUY {symbol}</b>\n'
                        f'Qty: {qty:.4f} @ ${price:,.2f}\n'
-                       f'TA confidence: {ta_conf:.0%} | Intel: {intel_conf:.0%}\n'
+                       f'TA conf: {ta_conf:.0%} | Intel: {intel_conf:.0%}\n'
                        f'Combined: {combined:.0%}\n'
                        f'RSI: {rsi:.1f} | MACD: {"Bull" if details.get("macd_bull") else "Bear"}\n'
                        f'Reasons: {chr(10).join(reasons[:3])}')
                 send_telegram(msg)
+                traded = True
     elif signal == -1 and qty_held > 0:
         order = place_order(symbol, OrderSide.SELL, qty_held)
         if order:
             send_telegram(f'<b>SELL {symbol}</b>\nQty: {qty_held:.4f} @ ${price:,.2f}\nTA signal: bearish')
+            traded = True
+    return traded
+
+def force_entry(portfolio):
+    """Force enter the best available opportunity when idle too long."""
+    log.info('FORCE ENTRY: idle too long, scanning for best opportunity...')
+    best = find_best_opportunity()
+    if best is None or best['details'].get('price', 0) == 0:
+        log.info('FORCE ENTRY: no viable opportunity found')
+        return False
+    sym = best['symbol']
+    price = best['details']['price']
+    qty_held = get_position_qty(sym)
+    if qty_held > 0:
+        log.info(f'FORCE ENTRY: already holding {sym}')
+        return False
+    max_qty = (portfolio * MAX_POSITION_PCT * 0.5) / price  # Half size for forced entries
+    qty = max(max_qty * 0.5, 1.0 / price)
+    if qty * price < 1.0:
+        return False
+    order = place_order(sym, OrderSide.BUY, qty)
+    if order:
+        intel = best.get('intel', {})
+        msg = (f'<b>FORCE BUY {sym}</b>\n'
+               f'Qty: {qty:.4f} @ ${price:,.2f}\n'
+               f'Conf: {best["confidence"]:.0%}\n'
+               f'RSI: {best["details"].get("rsi", 0):.1f}\n'
+               f'Reason: Idle {idle_cycles} cycles, best available opportunity')
+        send_telegram(msg)
+        return True
+    return False
 
 def trade_cycle():
+    global idle_cycles
     portfolio = get_portfolio_value()
     daily_pnl = get_daily_pnl_pct()
-    log.info(f'Portfolio: ${portfolio:,.2f} | PnL: {daily_pnl:.2%}')
+    log.info(f'Portfolio: ${portfolio:,.2f} | PnL: {daily_pnl:.2%} | Idle cycles: {idle_cycles}')
     if daily_pnl >= DAILY_PROFIT_TARGET:
         log.info('TARGET REACHED!')
         send_telegram(f'<b>TARGET REACHED!</b> PnL={daily_pnl:.2%} - closing all positions')
         trade_client.close_all_positions(cancel_orders=True)
+        idle_cycles = 0
         return
     refresh_intelligence()
     check_trailing_stops()
+    traded = False
     for sym in CRYPTO_SYMBOLS:
         try:
-            trade_symbol(sym, True, portfolio)
+            if trade_symbol(sym, True, portfolio):
+                traded = True
         except Exception as e:
             log.error(f'{sym}: {e}')
     for sym in STOCK_SYMBOLS:
         try:
-            trade_symbol(sym, False, portfolio)
+            if trade_symbol(sym, False, portfolio):
+                traded = True
         except Exception as e:
             log.error(f'{sym}: {e}')
+    if traded:
+        idle_cycles = 0
+    else:
+        idle_cycles += 1
+        log.info(f'No trades this cycle. Idle count: {idle_cycles}/{FORCE_ENTRY_AFTER_CYCLES}')
+    # Force entry if idle too long and no positions
+    if idle_cycles >= FORCE_ENTRY_AFTER_CYCLES:
+        try:
+            positions = trade_client.get_all_positions()
+            if len(positions) == 0:
+                if force_entry(portfolio):
+                    idle_cycles = 0
+        except Exception as e:
+            log.error(f'Force entry check: {e}')
 
 def main():
-    log.info('=== Intelligent Trading Bot v2 Started ===')
-    send_telegram('<b>Bot v2 Started</b>\nTarget: 1% daily\nSources: CryptoPanic, CoinGecko, RSS feeds, Fear&Greed Index\nMulti-timeframe TA + Trailing Stops')
+    log.info('=== Aggressive Trading Bot v3 Started ===')
+    send_telegram('<b>Bot v3 AGGRESSIVE Started</b>\nTarget: 3%+ daily\nMin confidence: 15%\nForce entry after 5 idle cycles\nMax position: 40%\nStop-loss: 1.5% | Trailing: 0.8%')
     while True:
         try:
             trade_cycle()
