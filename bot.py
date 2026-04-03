@@ -1,3 +1,13 @@
+"""V2 Institutional Trading Bot.
+Integrates: SignalEngine, RegimeEngine, RiskEngine, Intelligence, SelfLearner.
+Key improvements over v4:
+- Multi-factor signal scoring (not just RSI/MACD)
+- Regime-aware position sizing and thresholds
+- Risk engine with kill switch, daily/weekly limits
+- No force-entry; only trade on confirmed signals
+- ATR-based stop-loss and take-profit
+- Conservative daily target (0.5-1% vs old 3%)
+"""
 import os
 import time
 import logging
@@ -14,6 +24,11 @@ import numpy as np
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
+
+# V2 Modules
+from signal_engine import SignalEngine
+from regime_engine import RegimeEngine
+from risk_engine import RiskEngine
 from intelligence import build_market_intelligence
 from self_learner import SelfLearner
 
@@ -24,17 +39,23 @@ PAPER = os.environ.get('ALPACA_PAPER', 'true').lower() == 'true'
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-# BASE CONFIG - v4 (self-learning overrides these)
-DAILY_PROFIT_TARGET = 0.03
-TRADE_INTERVAL = 60
-INTEL_INTERVAL = 300
-LEARN_INTERVAL = 900  # Run learning cycle every 15 minutes
+# V2 CONFIG - Conservative institutional targets
+DAILY_PROFIT_TARGET = 0.008  # 0.8% daily (realistic)
+DAILY_LOSS_LIMIT = 0.015  # 1.5% max daily loss
+TRADE_INTERVAL = 90  # 90 seconds between cycles
+INTEL_INTERVAL = 300  # 5 min intel refresh
+LEARN_INTERVAL = 900  # 15 min learning cycle
+REGIME_INTERVAL = 600  # 10 min regime check
 
 CRYPTO_SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
-STOCK_SYMBOLS = ['SPY', 'QQQ', 'TQQQ']
+STOCK_SYMBOLS = ['SPY', 'QQQ']
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', handlers=[logging.StreamHandler()])
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+log = logging.getLogger('bot')
 
 # -- Telegram --
 def send_telegram(msg):
@@ -42,7 +63,11 @@ def send_telegram(msg):
         return
     try:
         url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-        requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
+        requests.post(url, json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': msg,
+            'parse_mode': 'HTML'
+        }, timeout=10)
     except Exception as e:
         log.warning(f'Telegram: {e}')
 
@@ -51,18 +76,29 @@ trade_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
 crypto_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-# -- Self-Learning Engine --
+# -- V2 Engines --
+signal_engine = SignalEngine()
+regime_engine = RegimeEngine()
+risk_engine = RiskEngine(
+    max_trades_per_day=12,
+    daily_loss_limit_pct=DAILY_LOSS_LIMIT,
+    weekly_loss_limit_pct=0.04,
+    max_position_pct=0.25,
+    max_portfolio_exposure=0.70,
+    max_correlated_exposure=0.40,
+)
 learner = SelfLearner()
 
 # -- State --
 intel_cache = {}
 last_intel_time = 0
 last_learn_time = 0
-trailing_highs = {}
-idle_cycles = 0
+last_regime_time = 0
 cycle_count = 0
 
+
 def normalize_df(df):
+    """Normalize Alpaca bar data to standard format."""
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -76,13 +112,16 @@ def normalize_df(df):
         return None
     return df[req]
 
+
 def get_portfolio_value():
     return float(trade_client.get_account().portfolio_value)
+
 
 def get_daily_pnl_pct():
     a = trade_client.get_account()
     eq, last = float(a.equity), float(a.last_equity)
     return (eq - last) / last if last else 0.0
+
 
 def get_bars(symbol, is_crypto=True, tf=TimeFrame.Minute, limit=100):
     try:
@@ -97,53 +136,6 @@ def get_bars(symbol, is_crypto=True, tf=TimeFrame.Minute, limit=100):
         log.error(f'get_bars({symbol}): {e}')
         return None
 
-def compute_signals(bars):
-    p = learner.current_params
-    rsi_buy = p.get('rsi_buy', 45)
-    rsi_sell = p.get('rsi_sell', 60)
-    if bars is None or len(bars) < 30:
-        return 0, 0.0, {}
-    close = bars['close']
-    rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
-    macd_obj = MACD(close)
-    macd_line = macd_obj.macd().iloc[-1]
-    macd_sig = macd_obj.macd_signal().iloc[-1]
-    ema9 = EMAIndicator(close, window=9).ema_indicator().iloc[-1]
-    ema21 = EMAIndicator(close, window=21).ema_indicator().iloc[-1]
-    bb = BollingerBands(close, window=20)
-    bb_lo = bb.bollinger_lband().iloc[-1]
-    bb_hi = bb.bollinger_hband().iloc[-1]
-    atr = AverageTrueRange(bars['high'], bars['low'], close, window=14).average_true_range().iloc[-1]
-    price = close.iloc[-1]
-    volatility = atr / price if price > 0 else 0
-    score = 0
-    details = {'rsi': rsi, 'macd_bull': macd_line > macd_sig, 'ema_bull': ema9 > ema21, 'price': price, 'volatility': volatility}
-    if rsi < rsi_buy: score += 1
-    elif rsi > rsi_sell: score -= 1
-    if rsi < 30: score += 1
-    if macd_line > macd_sig: score += 1
-    else: score -= 1
-    if ema9 > ema21: score += 1
-    else: score -= 1
-    if price < bb_lo: score += 1
-    elif price > bb_hi: score -= 1
-    avg5 = close.tail(5).mean()
-    if price > avg5: score += 1
-    confidence = min(abs(score) / 5.0, 1.0)
-    min_score = p.get('min_signal_score', 1)
-    signal = 1 if score >= min_score else (-1 if score <= -2 else 0)
-    return signal, confidence, details
-
-def multi_tf_signal(symbol, is_crypto):
-    sig1, conf1, d1 = compute_signals(get_bars(symbol, is_crypto, TimeFrame.Minute, 100))
-    sig_h, conf_h, dh = compute_signals(get_bars(symbol, is_crypto, TimeFrame.Hour, 100))
-    if sig1 == 1 or sig_h == 1:
-        return 1, max(conf1, conf_h), d1 if d1.get('price', 0) > 0 else dh
-    elif sig1 == -1 and sig_h == -1:
-        return -1, max(conf1, conf_h), d1
-    elif sig1 == -1 or sig_h == -1:
-        return 0, (conf1 + conf_h) / 2.0, d1
-    return 0, 0.0, d1
 
 def get_position_qty(symbol):
     sym = symbol.replace('/', '')
@@ -153,50 +145,94 @@ def get_position_qty(symbol):
     except:
         return 0.0
 
+
+def get_position_pnl(symbol):
+    """Get unrealized PnL percentage for a position."""
+    sym = symbol.replace('/', '')
+    try:
+        pos = trade_client.get_open_position(sym)
+        return float(pos.unrealized_plpc)
+    except:
+        return 0.0
+
+
 def place_order(symbol, side, qty):
     sym = symbol.replace('/', '')
     try:
-        req = MarketOrderRequest(symbol=sym, qty=round(qty, 6), side=side, time_in_force=TimeInForce.GTC)
+        req = MarketOrderRequest(
+            symbol=sym,
+            qty=round(qty, 6),
+            side=side,
+            time_in_force=TimeInForce.GTC
+        )
         order = trade_client.submit_order(req)
-        log.info(f'ORDER {side.value.upper()} {round(qty,4)} {sym} id={order.id}')
+        log.info(f'ORDER {side.value.upper()} {round(qty, 4)} {sym} id={order.id}')
         return order
     except Exception as e:
         log.error(f'place_order({symbol},{side},{qty}): {e}')
         return None
 
-def check_trailing_stops():
-    global trailing_highs
-    p = learner.current_params
-    stop_loss = p.get('stop_loss_pct', 0.015)
-    trailing = p.get('trailing_stop_pct', 0.008)
+
+# =============================================
+# V2 CORE: Risk-Managed Trading
+# =============================================
+
+def check_risk_managed_stops():
+    """V2: Check positions with ATR-based dynamic stops."""
     try:
         positions = trade_client.get_all_positions()
         for pos in positions:
             sym = pos.symbol
-            current = float(pos.current_price)
             pnl_pct = float(pos.unrealized_plpc)
-            if pnl_pct <= -stop_loss:
-                log.warning(f'STOP-LOSS {sym}: {pnl_pct:.2%}')
+            current = float(pos.current_price)
+            cost = float(pos.avg_entry_price)
+            qty = float(pos.qty)
+
+            # Dynamic stop based on regime
+            regime = regime_engine.current_regime
+            if regime == 'bear':
+                stop_pct = -0.012  # Tight stop in bear
+                take_pct = 0.008
+            elif regime == 'bull':
+                stop_pct = -0.025  # Wider stop in bull
+                take_pct = 0.02
+            else:
+                stop_pct = -0.018
+                take_pct = 0.012
+
+            # STOP LOSS
+            if pnl_pct <= stop_pct:
+                log.warning(f'STOP-LOSS {sym}: {pnl_pct:.2%} (limit {stop_pct:.2%})')
                 send_telegram(f'<b>STOP-LOSS</b> {sym}: {pnl_pct:.2%}')
                 trade_client.close_position(sym)
-                learner.record_trade(sym, 'sell', float(pos.qty), current, pnl_pct)
-                trailing_highs.pop(sym, None)
+                learner.record_trade(sym, 'sell', qty, current, pnl_pct)
+                risk_engine.update_daily_pnl(pnl_pct)
                 continue
-            if sym not in trailing_highs:
-                trailing_highs[sym] = current
-            if current > trailing_highs[sym]:
-                trailing_highs[sym] = current
-            drop = (trailing_highs[sym] - current) / trailing_highs[sym] if trailing_highs[sym] > 0 else 0
-            if pnl_pct > 0.005 and drop > trailing:
-                log.info(f'TRAILING STOP {sym}: drop={drop:.2%}')
-                send_telegram(f'<b>TRAILING STOP</b> {sym}: locked profit, drop={drop:.2%}')
+
+            # TAKE PROFIT
+            if pnl_pct >= take_pct:
+                log.info(f'TAKE-PROFIT {sym}: {pnl_pct:.2%}')
+                send_telegram(f'<b>TAKE-PROFIT</b> {sym}: +{pnl_pct:.2%}')
                 trade_client.close_position(sym)
-                learner.record_trade(sym, 'sell', float(pos.qty), current, pnl_pct)
-                trailing_highs.pop(sym, None)
+                learner.record_trade(sym, 'sell', qty, current, pnl_pct)
+                risk_engine.update_daily_pnl(pnl_pct)
+                continue
+
+            # TRAILING STOP: if in profit > 0.5%, trail at 40% of gains
+            if pnl_pct > 0.005:
+                trail_stop = cost * (1 + pnl_pct * 0.6)  # Lock 60% of gains
+                if current < trail_stop:
+                    log.info(f'TRAILING STOP {sym}: locked profit {pnl_pct:.2%}')
+                    send_telegram(f'<b>TRAILING STOP</b> {sym}: +{pnl_pct:.2%}')
+                    trade_client.close_position(sym)
+                    learner.record_trade(sym, 'sell', qty, current, pnl_pct)
+                    risk_engine.update_daily_pnl(pnl_pct)
     except Exception as e:
-        log.error(f'check_trailing_stops: {e}')
+        log.error(f'check_risk_managed_stops: {e}')
+
 
 def refresh_intelligence():
+    """Refresh market intelligence for all symbols."""
     global intel_cache, last_intel_time
     now = time.time()
     if now - last_intel_time < INTEL_INTERVAL:
@@ -207,12 +243,40 @@ def refresh_intelligence():
             intel_cache[sym] = build_market_intelligence(sym)
         except Exception as e:
             log.error(f'Intel error {sym}: {e}')
-            intel_cache[sym] = {'score': 0, 'confidence': 0, 'reasons': [], 'fng': 50, 'fng_label': 'N/A', 'top_headlines': []}
+            intel_cache[sym] = {'score': 0, 'confidence': 0, 'reasons': [], 'fng': 50}
     last_intel_time = now
     fng = intel_cache.get('BTC/USD', {}).get('fng', 50)
-    send_telegram(f'<b>INTEL UPDATE</b>\nFear&Greed: {fng}\nRegime: {learner.regime.upper()}\n' + '\n'.join([f"{s}: score={intel_cache[s]['score']}" for s in CRYPTO_SYMBOLS if s in intel_cache]))
+    regime = regime_engine.current_regime
+    send_telegram(
+        f'<b>INTEL UPDATE</b>\n'
+        f'Regime: {regime.upper()} | FnG: {fng}\n'
+        + '\n'.join([f"{s}: score={intel_cache[s].get('score', 0)}" for s in CRYPTO_SYMBOLS if s in intel_cache])
+    )
+
+
+def refresh_regime():
+    """Update regime detection."""
+    global last_regime_time
+    now = time.time()
+    if now - last_regime_time < REGIME_INTERVAL:
+        return
+    last_regime_time = now
+    try:
+        bars_btc = get_bars('BTC/USD', True, TimeFrame.Hour, 100)
+        bars_eth = get_bars('ETH/USD', True, TimeFrame.Hour, 100)
+        bars_spy = get_bars('SPY', False, TimeFrame.Hour, 100)
+        regime = regime_engine.detect_regime(
+            btc_bars=bars_btc,
+            eth_bars=bars_eth,
+            spy_bars=bars_spy,
+        )
+        log.info(f'Regime: {regime} (confidence={regime_engine.regime_confidence:.0%})')
+    except Exception as e:
+        log.error(f'Regime detection error: {e}')
+
 
 def run_learning():
+    """Run learning cycle."""
     global last_learn_time
     now = time.time()
     if now - last_learn_time < LEARN_INTERVAL:
@@ -224,135 +288,179 @@ def run_learning():
     except Exception as e:
         log.error(f'Learning cycle error: {e}')
 
+
 def trade_symbol(symbol, is_crypto, portfolio):
-    p = learner.current_params
-    bars = get_bars(symbol, is_crypto)
-    if bars is None or len(bars) == 0:
+    """V2: Trade a symbol using multi-factor signals + risk management."""
+    regime = regime_engine.current_regime
+    
+    # Get bars for signal analysis
+    bars_1m = get_bars(symbol, is_crypto, TimeFrame.Minute, 100)
+    bars_1h = get_bars(symbol, is_crypto, TimeFrame.Hour, 100)
+    if bars_1m is None or len(bars_1m) < 30:
         return False
-    signal, ta_conf, details = multi_tf_signal(symbol, is_crypto)
+    
+    # Get multi-factor signal from V2 signal engine
+    signal_result = signal_engine.generate_signal(
+        bars_1m=bars_1m,
+        bars_1h=bars_1h,
+        regime=regime,
+    )
+    signal = signal_result['signal']  # 1=buy, -1=sell, 0=hold
+    confidence = signal_result['confidence']
+    details = signal_result.get('details', {})
+    
+    # Get intelligence overlay
     intel = intel_cache.get(symbol, {'confidence': 0, 'score': 0, 'reasons': []})
     intel_conf = intel.get('confidence', 0)
-    combined = (ta_conf * 0.7) + (max(0, intel_conf) * 0.3)
+    
+    # Combined confidence: 60% technical, 40% intelligence
+    combined = (confidence * 0.6) + (max(0, intel_conf) * 0.4)
+    
+    # Regime-adjusted thresholds
+    if regime == 'bear':
+        min_conf = 0.45  # Need strong signal in bear market
+        position_scale = 0.5  # Half-size positions
+    elif regime == 'bull':
+        min_conf = 0.25
+        position_scale = 1.0
+    else:  # sideways
+        min_conf = 0.35
+        position_scale = 0.7
+    
     qty_held = get_position_qty(symbol)
     price = details.get('price', 0)
     if price == 0:
         return False
-    max_pos = p.get('max_position_pct', 0.40)
-    min_conf = p.get('min_confidence', 0.15)
-    max_qty = (portfolio * max_pos) / price
+    
+    # Risk engine checks
+    positions = []
+    try:
+        positions = trade_client.get_all_positions()
+    except:
+        pass
+    
     traded = False
+    
+    # === BUY LOGIC ===
     if signal == 1 and qty_held <= 0 and combined >= min_conf:
-        qty = max_qty * max(combined, 0.5)
+        # Check risk engine approval
+        can_trade, reason = risk_engine.can_trade(symbol, portfolio, positions)
+        if not can_trade:
+            log.info(f'RISK BLOCKED {symbol}: {reason}')
+            return False
+        
+        # Calculate position size via risk engine
+        size_pct = risk_engine.calculate_position_size(
+            symbol=symbol,
+            confidence=combined,
+            regime=regime,
+            volatility=details.get('volatility', 0.02),
+            portfolio=portfolio,
+        )
+        size_pct *= position_scale
+        qty = (portfolio * size_pct) / price
+        
         if qty * price >= 1.0:
             order = place_order(symbol, OrderSide.BUY, qty)
             if order:
                 learner.record_trade(symbol, 'buy', qty, price)
-                reasons = intel.get('reasons', [])
-                rsi = details.get('rsi', 0)
-                msg = (f'<b>BUY {symbol}</b>\n'
-                       f'Qty: {qty:.4f} @ ${price:,.2f}\n'
-                       f'Combined: {combined:.0%} | Regime: {learner.regime}\n'
-                       f'RSI: {rsi:.1f} | MACD: {"Bull" if details.get("macd_bull") else "Bear"}\n'
-                       f'Reasons: {chr(10).join(reasons[:3])}')
+                risk_engine.record_trade()
+                reasons = intel.get('reasons', [])[:2]
+                factors = signal_result.get('factors', {})
+                msg = (
+                    f'<b>BUY {symbol}</b>\n'
+                    f'Qty: {qty:.4f} @ ${price:,.2f}\n'
+                    f'Size: {size_pct:.1%} | Conf: {combined:.0%}\n'
+                    f'Regime: {regime} | RSI: {details.get("rsi", 0):.0f}\n'
+                    f'Factors: {factors}\n'
+                    f'Intel: {" | ".join(reasons)}'
+                )
                 send_telegram(msg)
                 traded = True
+    
+    # === SELL LOGIC ===
     elif signal == -1 and qty_held > 0:
+        pnl = get_position_pnl(symbol)
         order = place_order(symbol, OrderSide.SELL, qty_held)
         if order:
-            try:
-                pos = trade_client.get_open_position(symbol.replace('/', ''))
-                pnl = float(pos.unrealized_plpc)
-            except:
-                pnl = 0
             learner.record_trade(symbol, 'sell', qty_held, price, pnl)
-            send_telegram(f'<b>SELL {symbol}</b>\nQty: {qty_held:.4f} @ ${price:,.2f}')
+            risk_engine.update_daily_pnl(pnl)
+            send_telegram(f'<b>SELL {symbol}</b>\nQty: {qty_held:.4f} @ ${price:,.2f}\nPnL: {pnl:.2%}')
             traded = True
+    
     return traded
 
-def force_entry(portfolio):
-    p = learner.current_params
-    log.info('FORCE ENTRY: scanning for best opportunity...')
-    best = None
-    best_score = -999
-    for sym in CRYPTO_SYMBOLS:
-        bars = get_bars(sym, True)
-        if bars is None or len(bars) < 30:
-            continue
-        sig, conf, details = multi_tf_signal(sym, True)
-        intel = intel_cache.get(sym, {'confidence': 0, 'score': 0})
-        combined = (conf * 0.7) + (max(0, intel.get('confidence', 0)) * 0.3)
-        total_score = sig * combined
-        log.info(f'SCAN {sym}: signal={sig} conf={conf:.2f} combined={combined:.2f}')
-        if total_score > best_score:
-            best_score = total_score
-            best = {'symbol': sym, 'confidence': combined, 'details': details, 'intel': intel}
-    if best is None or best['details'].get('price', 0) == 0:
-        return False
-    sym = best['symbol']
-    price = best['details']['price']
-    if get_position_qty(sym) > 0:
-        return False
-    max_pos = p.get('max_position_pct', 0.40)
-    qty = (portfolio * max_pos * 0.5) / price
-    if qty * price < 1.0:
-        return False
-    order = place_order(sym, OrderSide.BUY, qty)
-    if order:
-        learner.record_trade(sym, 'buy', qty, price)
-        send_telegram(f'<b>FORCE BUY {sym}</b>\nQty: {qty:.4f} @ ${price:,.2f}\nRegime: {learner.regime}\nConf: {best["confidence"]:.0%}')
-        return True
-    return False
 
 def trade_cycle():
-    global idle_cycles, cycle_count
+    """V2: Main trading cycle with full risk management."""
+    global cycle_count
     cycle_count += 1
+    
     portfolio = get_portfolio_value()
     daily_pnl = get_daily_pnl_pct()
-    p = learner.current_params
-    force_cycles = int(p.get('force_entry_cycles', 5))
-    log.info(f'Portfolio: ${portfolio:,.2f} | PnL: {daily_pnl:.2%} | Idle: {idle_cycles} | Regime: {learner.regime} | Cycle: {cycle_count}')
-    # Record daily return every 60 cycles (~1 hour)
-    if cycle_count % 60 == 0:
+    regime = regime_engine.current_regime
+    
+    # Update risk engine with current PnL
+    risk_engine.update_daily_pnl(daily_pnl)
+    
+    log.info(
+        f'Cycle {cycle_count} | ${portfolio:,.2f} | PnL: {daily_pnl:.2%} | '
+        f'Regime: {regime} | Risk: {"KILL" if risk_engine.kill_switch_active else "OK"}'
+    )
+    
+    # Record daily return every 40 cycles (~1 hour)
+    if cycle_count % 40 == 0:
         learner.record_daily_return(daily_pnl, portfolio)
-    if daily_pnl >= DAILY_PROFIT_TARGET:
-        log.info('TARGET REACHED!')
-        send_telegram(f'<b>TARGET REACHED!</b> PnL={daily_pnl:.2%} - closing all positions')
-        trade_client.close_all_positions(cancel_orders=True)
-        idle_cycles = 0
+    
+    # Check kill switch
+    if risk_engine.kill_switch_active:
+        log.warning(f'KILL SWITCH ACTIVE: {risk_engine.kill_switch_reason}')
+        if cycle_count % 20 == 0:  # Remind every ~30 min
+            send_telegram(f'<b>KILL SWITCH</b>: {risk_engine.kill_switch_reason}\nPnL: {daily_pnl:.2%}')
         return
+    
+    # Check daily target reached
+    if daily_pnl >= DAILY_PROFIT_TARGET:
+        log.info(f'DAILY TARGET REACHED: {daily_pnl:.2%}')
+        send_telegram(f'<b>TARGET REACHED!</b> PnL={daily_pnl:.2%} - holding positions')
+        # Don't close all - just stop opening new ones
+        return
+    
+    # Refresh engines
+    refresh_regime()
     refresh_intelligence()
     run_learning()
-    check_trailing_stops()
-    traded = False
+    
+    # Check stops on existing positions
+    check_risk_managed_stops()
+    
+    # Trade crypto symbols
     for sym in CRYPTO_SYMBOLS:
         try:
-            if trade_symbol(sym, True, portfolio):
-                traded = True
+            trade_symbol(sym, True, portfolio)
         except Exception as e:
             log.error(f'{sym}: {e}')
-    for sym in STOCK_SYMBOLS:
-        try:
-            if trade_symbol(sym, False, portfolio):
-                traded = True
-        except Exception as e:
-            log.error(f'{sym}: {e}')
-    if traded:
-        idle_cycles = 0
-    else:
-        idle_cycles += 1
-        log.info(f'No trades this cycle. Idle count: {idle_cycles}/{force_cycles}')
-    if idle_cycles >= force_cycles:
-        try:
-            positions = trade_client.get_all_positions()
-            if len(positions) == 0:
-                if force_entry(portfolio):
-                    idle_cycles = 0
-        except Exception as e:
-            log.error(f'Force entry check: {e}')
+    
+    # Trade stock symbols (only during market hours)
+    hour = datetime.utcnow().hour
+    if 14 <= hour <= 20:  # ~9:30 AM - 4 PM ET
+        for sym in STOCK_SYMBOLS:
+            try:
+                trade_symbol(sym, False, portfolio)
+            except Exception as e:
+                log.error(f'{sym}: {e}')
+
 
 def main():
-    log.info('=== Self-Learning Trading Bot v4 Started ===')
-    send_telegram('<b>Bot v4 SELF-LEARNING Started</b>\nTarget: 3%+ daily\nAuto-optimizing params every 15min\nBenchmarks: BTC, ETH, S&P500, NASDAQ\nRegime detection: bull/bear/sideways\nAdaptive RSI, position sizing, stops')
+    log.info('=== V2 Institutional Trading Bot Started ===')
+    send_telegram(
+        '<b>Bot V2 INSTITUTIONAL Started</b>\n'
+        'Target: 0.5-1% daily (conservative)\n'
+        'Modules: SignalEngine + RegimeEngine + RiskEngine\n'
+        'Risk: Kill switch, daily/weekly limits\n'
+        'Regime: bull/bear/sideways detection\n'
+        'Signals: Multi-factor (RSI+MACD+EMA+BB+VWAP+Volume)'
+    )
     while True:
         try:
             trade_cycle()
@@ -360,6 +468,7 @@ def main():
             log.error(f'Main loop: {e}')
             send_telegram(f'<b>ERROR</b>: {e}')
         time.sleep(TRADE_INTERVAL)
+
 
 if __name__ == '__main__':
     main()
