@@ -1,4 +1,4 @@
-"""V2 Institutional Trading Bot.
+"""V3 INSTITUTIONAL Trading Bot.
 Integrates: SignalEngine, RegimeEngine, RiskEngine, Intelligence, SelfLearner.
 Key improvements over v4:
 - Multi-factor signal scoring (not just RSI/MACD)
@@ -32,6 +32,12 @@ from regime_engine import RegimeEngine
 from risk_engine import RiskEngine
 from intelligence import build_market_intelligence
 from self_learner import SelfLearner
+
+# V3 Modules
+from universe import UNIVERSE, get_asset_class, get_tradeable_symbols
+from momentum_engine import MomentumEngine
+from allocation_engine import AllocationEngine
+from execution_engine import ExecutionEngine
 
 # -- Config --
 ALPACA_API_KEY = os.environ.get('ALPACA_API_KEY', '')
@@ -93,6 +99,15 @@ learner = SelfLearner()
 # -- State --
 intel_cache = {}
 last_intel_time = 0
+
+# -- V3 Engines --
+momentum_engine = MomentumEngine()
+allocation_engine = AllocationEngine(target_volatility=0.12, max_leverage=1.0)
+execution_engine = ExecutionEngine(trade_client, min_order_value=1.0)
+
+# V3 State
+REBALANCE_INTERVAL = 1800  # 30 min between rebalances
+last_rebalance_time = 0
 last_learn_time = 0
 last_regime_time = 0
 cycle_count = 0
@@ -437,9 +452,13 @@ def trade_cycle():
     # Check stops on existing positions
     check_risk_managed_stops()
 
+    
+    # V3: Run allocation-based rebalancing
+    run_v3_rebalance()
     # Trade crypto symbols
     for sym in CRYPTO_SYMBOLS:
         try:
+            
             trade_symbol(sym, True, portfolio)
         except Exception as e:
             log.error(f'{sym}: {e}')
@@ -454,9 +473,100 @@ def trade_cycle():
                 log.error(f'{sym}: {e}')
 
 def main():
-    log.info('=== V2 Institutional Trading Bot Started ===')
+    log.info('=== V3 INSTITUTIONAL Trading Bot Started ===')
     send_telegram(
-        '<b>Bot V2 INSTITUTIONAL Started</b>\n'
+        '<b>Bot V3 INSTITUTIONAL Started</b>\n'
+        
+# =============================================
+# V3: ALLOCATION-BASED REBALANCING
+# =============================================
+def run_v3_rebalance():
+    """V3: Run allocation-based portfolio rebalancing."""
+    global last_rebalance_time
+    now = time.time()
+    if now - last_rebalance_time < REBALANCE_INTERVAL:
+        return
+    last_rebalance_time = now
+    
+    try:
+        portfolio = get_portfolio_value()
+        regime = regime_engine.current_regime
+        log.info(f'V3 REBALANCE | regime={regime} | portfolio=${portfolio:,.2f}')
+        
+        # Gather price data for momentum computation
+        price_data = {}
+        all_symbols = get_tradeable_symbols()
+        for sym_info in all_symbols:
+            sym = sym_info['symbol']
+            is_crypto = sym_info.get('asset_class', '') in ['crypto_major', 'crypto_alt']
+            try:
+                bars = get_bars(sym, is_crypto, TimeFrame.Day, 60)
+                if bars is not None and len(bars) >= 20:
+                    price_data[sym] = bars['close'].tolist()
+            except Exception as e:
+                log.debug(f'Price data skip {sym}: {e}')
+        
+        if len(price_data) < 3:
+            log.warning('V3: Insufficient price data for rebalance')
+            return
+        
+        # Compute momentum scores
+        momentum_engine.compute(price_data)
+        
+        # Compute target allocations
+        allocations = allocation_engine.compute_allocations(
+            regime=regime,
+            momentum_engine=momentum_engine,
+            price_data=price_data,
+            portfolio_value=portfolio,
+        )
+        
+        if not allocations:
+            log.info('V3: No allocations computed')
+            return
+        
+        # Get current positions
+        current_positions = execution_engine.get_current_positions()
+        
+        # Check if rebalance needed
+        if not allocation_engine.should_rebalance(current_positions, portfolio):
+            log.info('V3: No rebalance needed (within drift threshold)')
+            return
+        
+        # Compute rebalance trades
+        trades = allocation_engine.compute_rebalance_trades(
+            current_positions, allocations, portfolio
+        )
+        
+        if not trades:
+            log.info('V3: No trades needed')
+            return
+        
+        # Get current prices for execution
+        prices = {}
+        for sym, data in price_data.items():
+            if data:
+                prices[sym] = data[-1]
+        
+        # Execute rebalance
+        result = execution_engine.execute_rebalance(trades, prices)
+        
+        # Report
+        summary = allocation_engine.get_summary()
+        msg = (
+            f'<b>V3 REBALANCE</b>\n'
+            f'Regime: {regime} | Positions: {summary.get("n_positions", 0)}\n'
+            f'Invested: {summary.get("total_invested_pct", 0):.1%} | '
+            f'Cash: {summary.get("cash_pct", 0):.1%}\n'
+            f'Trades: {result.get("executed", 0)} executed, '
+            f'{result.get("failed", 0)} failed'
+        )
+        send_telegram(msg)
+        log.info(msg.replace('<b>', '').replace('</b>', ''))
+        
+    except Exception as e:
+        log.error(f'V3 rebalance error: {e}')
+
         'Target: 0.5-1% daily (conservative)\n'
         'Modules: SignalEngine + RegimeEngine + RiskEngine\n'
         'Risk: Kill switch, daily/weekly limits\n'
