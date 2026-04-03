@@ -87,12 +87,13 @@ def get_crypto_symbols():
     return [s for s in UNIVERSE if is_crypto(s)]
 
 
-def get_max_position(symbol):
-    """Get max position size for a symbol."""
-
-    def get_tradeable_symbols():
+def get_tradeable_symbols():
     """Get all symbols with metadata for trading."""
     return [{'symbol': s, 'asset_class': m['class'], 'name': m['name']} for s, m in UNIVERSE.items()]
+
+
+def get_max_position(symbol):
+    """Get max position size for a symbol."""
     ac = get_asset_class(symbol)
     if ac == CRYPTO:
         return MAX_SINGLE_CRYPTO
