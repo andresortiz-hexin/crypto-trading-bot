@@ -472,11 +472,7 @@ def trade_cycle():
             except Exception as e:
                 log.error(f'{sym}: {e}')
 
-def main():
-    log.info('=== V3 INSTITUTIONAL Trading Bot Started ===')
-    send_telegram(
-        '<b>Bot V3 INSTITUTIONAL Started</b>\n'
-        
+
 # =============================================
 # V3: ALLOCATION-BASED REBALANCING
 # =============================================
@@ -487,13 +483,10 @@ def run_v3_rebalance():
     if now - last_rebalance_time < REBALANCE_INTERVAL:
         return
     last_rebalance_time = now
-    
     try:
         portfolio = get_portfolio_value()
         regime = regime_engine.current_regime
         log.info(f'V3 REBALANCE | regime={regime} | portfolio=${portfolio:,.2f}')
-        
-        # Gather price data for momentum computation
         price_data = {}
         all_symbols = get_tradeable_symbols()
         for sym_info in all_symbols:
@@ -505,53 +498,32 @@ def run_v3_rebalance():
                     price_data[sym] = bars['close'].tolist()
             except Exception as e:
                 log.debug(f'Price data skip {sym}: {e}')
-        
         if len(price_data) < 3:
             log.warning('V3: Insufficient price data for rebalance')
             return
-        
-        # Compute momentum scores
         momentum_engine.compute(price_data)
-        
-        # Compute target allocations
         allocations = allocation_engine.compute_allocations(
-            regime=regime,
-            momentum_engine=momentum_engine,
-            price_data=price_data,
-            portfolio_value=portfolio,
+            regime=regime, momentum_engine=momentum_engine,
+            price_data=price_data, portfolio_value=portfolio,
         )
-        
         if not allocations:
             log.info('V3: No allocations computed')
             return
-        
-        # Get current positions
         current_positions = execution_engine.get_current_positions()
-        
-        # Check if rebalance needed
         if not allocation_engine.should_rebalance(current_positions, portfolio):
             log.info('V3: No rebalance needed (within drift threshold)')
             return
-        
-        # Compute rebalance trades
         trades = allocation_engine.compute_rebalance_trades(
             current_positions, allocations, portfolio
         )
-        
         if not trades:
             log.info('V3: No trades needed')
             return
-        
-        # Get current prices for execution
         prices = {}
         for sym, data in price_data.items():
             if data:
                 prices[sym] = data[-1]
-        
-        # Execute rebalance
         result = execution_engine.execute_rebalance(trades, prices)
-        
-        # Report
         summary = allocation_engine.get_summary()
         msg = (
             f'<b>V3 REBALANCE</b>\n'
@@ -563,10 +535,13 @@ def run_v3_rebalance():
         )
         send_telegram(msg)
         log.info(msg.replace('<b>', '').replace('</b>', ''))
-        
     except Exception as e:
         log.error(f'V3 rebalance error: {e}')
 
+def main():
+    log.info('=== V3 INSTITUTIONAL Trading Bot Started ===')
+    send_telegram(
+        '<b>Bot V3 INSTITUTIONAL Started</b>\n'
         'Target: 0.5-1% daily (conservative)\n'
         'Modules: SignalEngine + RegimeEngine + RiskEngine\n'
         'Risk: Kill switch, daily/weekly limits\n'
