@@ -1,32 +1,28 @@
 """Health Monitor - Auto-healing watchdog for the trading bot.
-Monitors bot health via heartbeat file, detects paralysis,
-auto-restarts on failure, and sends Telegram alerts.
+Monitors bot process health via stdout activity detection.
+Auto-restarts on crash or paralysis. Sends Telegram alerts.
+No modifications needed in bot.py - monitors subprocess externally.
 """
 import os
 import sys
 import time
-import signal
+import threading
 import logging
 import subprocess
 import requests
-import traceback
-from datetime import datetime, timezone
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s [health_monitor] %(message)s',
+    format='%(asctime)s %(levelname)s [monitor] %(message)s',
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger('health_monitor')
+log = logging.getLogger('monitor')
 
 # Config
-HEARTBEAT_FILE = '/tmp/bot_heartbeat'
-HEALTH_FILE = '/tmp/bot_health.json'
-MAX_HEARTBEAT_AGE = 300  # 5 min without heartbeat = dead
-MAX_CONSECUTIVE_ERRORS = 5
-MAX_RESTARTS = 10  # Max restarts before giving up
+MAX_SILENCE = 300  # 5 min no output = stuck
+MAX_RESTARTS = 15  # max auto-restarts
 RESTART_COOLDOWN = 30  # seconds between restarts
-CHECK_INTERVAL = 30  # check every 30 seconds
+CHECK_INTERVAL = 20  # health check every 20s
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
@@ -45,45 +41,22 @@ def send_telegram(msg):
         pass
 
 
-def read_heartbeat():
-    """Read last heartbeat timestamp from file."""
-    try:
-        if os.path.exists(HEARTBEAT_FILE):
-            with open(HEARTBEAT_FILE, 'r') as f:
-                return float(f.read().strip())
-    except (ValueError, IOError):
-        pass
-    return None
-
-
-def read_health():
-    """Read health status JSON from bot."""
-    import json
-    try:
-        if os.path.exists(HEALTH_FILE):
-            with open(HEALTH_FILE, 'r') as f:
-                return json.load(f)
-    except (ValueError, IOError):
-        pass
-    return {}
-
-
 class BotSupervisor:
-    """Supervises bot.py process with auto-healing."""
+    """Monitors and auto-restarts bot.py on failure or paralysis."""
 
     def __init__(self):
         self.process = None
-        self.restart_count = 0
         self.total_restarts = 0
-        self.last_restart_time = 0
         self.consecutive_failures = 0
+        self.last_restart = 0
+        self.last_output = time.time()
         self.start_time = time.time()
-        self.last_healthy_time = time.time()
+        self.output_lock = threading.Lock()
 
     def start_bot(self):
         """Start or restart the bot process."""
         if self.process and self.process.poll() is None:
-            log.warning('Killing stuck bot process...')
+            log.warning('Terminating stuck bot...')
             try:
                 self.process.terminate()
                 self.process.wait(timeout=10)
@@ -93,113 +66,88 @@ class BotSupervisor:
             except Exception as e:
                 log.error(f'Kill error: {e}')
 
-        # Clear old heartbeat
-        try:
-            if os.path.exists(HEARTBEAT_FILE):
-                os.remove(HEARTBEAT_FILE)
-        except IOError:
-            pass
-
-        log.info(f'Starting bot (restart #{self.total_restarts})...')
+        log.info(f'Starting bot (attempt #{self.total_restarts + 1})...')
         self.process = subprocess.Popen(
-            [sys.executable, 'bot.py'],
+            [sys.executable, '-u', 'bot.py'],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
             universal_newlines=True
         )
-        self.last_restart_time = time.time()
+        with self.output_lock:
+            self.last_output = time.time()
+        self.last_restart = time.time()
         self.total_restarts += 1
-        return True
 
-    def stream_output(self):
-        """Non-blocking read of bot stdout."""
-        if not self.process or not self.process.stdout:
-            return
-        import select
-        while True:
-            try:
-                ready, _, _ = select.select(
-                    [self.process.stdout], [], [], 0
-                )
-                if not ready:
-                    break
-                line = self.process.stdout.readline()
-                if not line:
-                    break
-                print(line.rstrip())
-            except Exception:
-                break
+        # Start output reader thread
+        t = threading.Thread(target=self._read_output, daemon=True)
+        t.start()
+
+    def _read_output(self):
+        """Read bot stdout in background thread."""
+        try:
+            for line in self.process.stdout:
+                line = line.rstrip()
+                if line:
+                    print(line, flush=True)
+                    with self.output_lock:
+                        self.last_output = time.time()
+        except Exception:
+            pass
 
     def check_health(self):
-        """Check if bot is healthy. Returns (healthy, reason)."""
-        # Check if process is alive
+        """Returns (healthy, reason)."""
         if self.process is None:
-            return False, 'process_not_started'
+            return False, 'not_started'
 
-        if self.process.poll() is not None:
-            exit_code = self.process.returncode
-            return False, f'process_exited (code={exit_code})'
+        exit_code = self.process.poll()
+        if exit_code is not None:
+            return False, f'crashed (exit={exit_code})'
 
-        # Check heartbeat freshness
-        hb = read_heartbeat()
-        if hb is None:
-            # Allow grace period after restart (2 min)
-            elapsed = time.time() - self.last_restart_time
-            if elapsed > 120:
-                return False, 'no_heartbeat_after_startup'
+        # Check output activity
+        with self.output_lock:
+            silence = time.time() - self.last_output
+
+        # Grace period after start (3 min)
+        since_start = time.time() - self.last_restart
+        if since_start < 180:
             return True, 'starting_up'
 
-        age = time.time() - hb
-        if age > MAX_HEARTBEAT_AGE:
-            return False, f'heartbeat_stale ({age:.0f}s old)'
+        if silence > MAX_SILENCE:
+            return False, f'no_output ({silence:.0f}s)'
 
-        # Check health file for error counts
-        health = read_health()
-        errors = health.get('consecutive_errors', 0)
-        if errors >= MAX_CONSECUTIVE_ERRORS:
-            return False, f'too_many_errors ({errors})'
-
-        self.last_healthy_time = time.time()
         return True, 'ok'
 
     def handle_failure(self, reason):
-        """Handle a detected failure with auto-recovery."""
+        """Auto-recover from failure."""
         self.consecutive_failures += 1
-        log.error(
-            f'Bot unhealthy: {reason} '
-            f'(failure {self.consecutive_failures})'
-        )
+        log.error(f'UNHEALTHY: {reason} (failure #{self.consecutive_failures})')
 
         if self.total_restarts >= MAX_RESTARTS:
             msg = (
-                f'<b>CRITICAL: Bot exceeded max restarts '
-                f'({MAX_RESTARTS})</b>\n'
+                f'<b>CRITICAL: Max restarts ({MAX_RESTARTS}) reached</b>\n'
                 f'Reason: {reason}\n'
-                f'Manual intervention required!'
+                'Manual intervention required!'
             )
-            log.critical(msg)
             send_telegram(msg)
+            log.critical(msg)
             return False
 
-        # Cooldown between restarts
-        elapsed = time.time() - self.last_restart_time
+        # Cooldown
+        elapsed = time.time() - self.last_restart
         if elapsed < RESTART_COOLDOWN:
-            wait = RESTART_COOLDOWN - elapsed
-            log.info(f'Cooldown: waiting {wait:.0f}s...')
-            time.sleep(wait)
+            time.sleep(RESTART_COOLDOWN - elapsed)
 
-        # Send alert
         uptime = time.time() - self.start_time
         msg = (
-            f'<b>BOT AUTO-RESTART #{self.total_restarts}</b>\n'
+            f'<b>BOT AUTO-RESTART #{self.total_restarts + 1}</b>\n'
             f'Reason: {reason}\n'
-            f'Failures: {self.consecutive_failures}\n'
-            f'Uptime was: {uptime/3600:.1f}h'
+            f'Consecutive failures: {self.consecutive_failures}\n'
+            f'Total uptime: {uptime/3600:.1f}h'
         )
         send_telegram(msg)
+        log.info(f'Restarting bot... (reason: {reason})')
 
-        # Restart
         self.start_bot()
         return True
 
@@ -208,39 +156,33 @@ class BotSupervisor:
         log.info('=== Health Monitor Started ===')
         send_telegram(
             '<b>Health Monitor Active</b>\n'
-            'Auto-restart on failure\n'
-            f'Heartbeat timeout: {MAX_HEARTBEAT_AGE}s\n'
-            f'Max restarts: {MAX_RESTARTS}'
+            f'Max silence: {MAX_SILENCE}s\n'
+            f'Max restarts: {MAX_RESTARTS}\n'
+            'Auto-restart on crash or hang'
         )
 
         self.start_bot()
 
         while True:
             try:
-                # Stream bot output to our stdout
-                self.stream_output()
-
-                # Check health
                 healthy, reason = self.check_health()
 
                 if healthy:
                     self.consecutive_failures = 0
                 else:
-                    can_continue = self.handle_failure(reason)
-                    if not can_continue:
-                        log.critical('Giving up after max restarts')
+                    ok = self.handle_failure(reason)
+                    if not ok:
                         send_telegram(
-                            '<b>CRITICAL: Monitor giving up</b>\n'
-                            'Max restarts exceeded. '
-                            'Manual intervention needed.'
+                            '<b>CRITICAL: Monitor stopped</b>\n'
+                            'Max restarts exceeded.'
                         )
                         sys.exit(1)
 
                 time.sleep(CHECK_INTERVAL)
 
             except KeyboardInterrupt:
-                log.info('Monitor stopped by user')
-                if self.process:
+                log.info('Stopped by user')
+                if self.process and self.process.poll() is None:
                     self.process.terminate()
                 break
             except Exception as e:
@@ -249,5 +191,4 @@ class BotSupervisor:
 
 
 if __name__ == '__main__':
-    supervisor = BotSupervisor()
-    supervisor.run()
+    BotSupervisor().run()
