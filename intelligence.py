@@ -17,6 +17,7 @@ BULLISH_KEYWORDS = {
     'launch': 1, 'all-time': 2, 'ath': 2, 'institutional': 2,
     'halving': 2, 'bullish': 2, 'soar': 2, 'gain': 1,
 }
+
 BEARISH_KEYWORDS = {
     'crash': 3, 'dump': 2, 'bear': 1, 'hack': 3, 'ban': 3,
     'regulation': 2, 'sell': 1, 'fear': 2, 'lawsuit': 2, 'sec': 2,
@@ -29,6 +30,7 @@ BEARISH_KEYWORDS = {
 # --- Sentiment cache with TTL ---
 _sentiment_cache = {}
 CACHE_TTL = 180  # 3 minutes
+
 
 def _cached_get(url, timeout=8, headers=None):
     """Simple cache for HTTP GET to avoid rate limits."""
@@ -60,7 +62,6 @@ def get_fear_and_greed():
             return 50, 'Neutral', 0
         current = int(entries[0]['value'])
         label = entries[0]['value_classification']
-        # Calculate momentum (change over last 7 days)
         if len(entries) >= 7:
             week_ago = int(entries[-1]['value'])
             momentum = current - week_ago
@@ -87,30 +88,56 @@ def score_text(text):
 
 
 def get_cryptopanic_sentiment(symbol='BTC'):
-    """Get sentiment from CryptoPanic with weighted scoring."""
+    """Get sentiment using CoinGecko coin data as proxy.
+    V2 Fix: Replaced broken CryptoPanic free API with CoinGecko market+community data.
+    """
     try:
+        coin_map = {
+            'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana',
+        }
         coin = symbol.replace('/USD', '').replace('/USDT', '')
-        url = f'https://cryptopanic.com/api/v1/posts/?auth_token=free&currencies={coin}&public=true'
+        coin_id = coin_map.get(coin, coin.lower())
+        url = (
+            f'https://api.coingecko.com/api/v3/coins/{coin_id}'
+            '?localization=false&tickers=false&community_data=true&developer_data=false'
+        )
         data = _cached_get(url)
         if not data:
             return 0, []
-        items = data.get('results', [])
-        if not items:
-            return 0, []
-        total = 0
-        headlines = []
-        for i, item in enumerate(items[:15]):
-            title = item.get('title', '')
-            # Apply recency decay: newer headlines matter more
-            decay = 1.0 - (i * 0.05)
-            total += score_text(title) * decay
-            if i < 5:
-                headlines.append(title)
-        sentiment = total / max(len(items[:15]), 1)
-        log.info(f'CryptoPanic {coin}: sentiment={sentiment:.2f} from {len(items[:15])} headlines')
-        return sentiment, headlines[:3]
+
+        md = data.get('market_data', {})
+        price_24h = md.get('price_change_percentage_24h', 0) or 0
+        price_7d = md.get('price_change_percentage_7d', 0) or 0
+        sentiment_up = data.get('sentiment_votes_up_percentage', 50) or 50
+        sentiment_down = data.get('sentiment_votes_down_percentage', 50) or 50
+
+        score = 0.0
+        reasons = []
+        if price_24h > 3:
+            score += 1.5
+            reasons.append(f'{coin} up {price_24h:.1f}% 24h')
+        elif price_24h < -3:
+            score -= 1.5
+            reasons.append(f'{coin} down {price_24h:.1f}% 24h')
+
+        if price_7d > 5:
+            score += 1.0
+            reasons.append(f'{coin} up {price_7d:.1f}% 7d')
+        elif price_7d < -5:
+            score -= 1.0
+            reasons.append(f'{coin} down {price_7d:.1f}% 7d')
+
+        if sentiment_up > 65:
+            score += 0.5
+            reasons.append(f'Community bullish {sentiment_up:.0f}%')
+        elif sentiment_down > 65:
+            score -= 0.5
+            reasons.append(f'Community bearish {sentiment_down:.0f}%')
+
+        log.info(f'Sentiment {coin}: score={score:.2f} from CoinGecko data')
+        return score, reasons[:3]
     except Exception as e:
-        log.warning(f'CryptoPanic error: {e}')
+        log.warning(f'Sentiment error ({symbol}): {e}')
         return 0, []
 
 
@@ -160,7 +187,7 @@ def get_coin_data(symbol):
 
 def build_market_intelligence(symbol):
     """Build comprehensive market intelligence with weighted scoring.
-    
+
     V2: Weighted sources, contrarian signals, volume analysis.
     Returns dict with score, confidence, and detailed breakdown.
     """
@@ -168,29 +195,29 @@ def build_market_intelligence(symbol):
     cp_sentiment, cp_headlines = get_cryptopanic_sentiment(symbol)
     btc_dom, mcap_change, _ = get_global_market_sentiment()
     coin = get_coin_data(symbol)
-    
+
     price_24h = coin.get('price_change_24h', 0)
     price_7d = coin.get('price_change_7d', 0)
     price_30d = coin.get('price_change_30d', 0)
-    
+
     # --- Weighted Intelligence Score (max ~10) ---
     intel_score = 0
     reasons = []
-    
+
     # 1. Fear & Greed (weight: 2x) - CONTRARIAN approach
     if fng_value >= 75:
-        intel_score -= 1  # Extreme greed = contrarian sell signal
+        intel_score -= 1
         reasons.append(f'Extreme Greed ({fng_value}) - contrarian caution')
     elif fng_value >= 55:
         intel_score += 1
         reasons.append(f'Greed zone ({fng_value}) - favorable')
     elif fng_value <= 20:
-        intel_score += 2  # Extreme fear = contrarian buy signal
+        intel_score += 2
         reasons.append(f'Extreme Fear ({fng_value}) - contrarian BUY')
     elif fng_value <= 35:
         intel_score -= 1
         reasons.append(f'Fear zone ({fng_value}) - cautious')
-    
+
     # FNG momentum bonus
     if fng_momentum > 10:
         intel_score += 1
@@ -198,21 +225,21 @@ def build_market_intelligence(symbol):
     elif fng_momentum < -10:
         intel_score -= 1
         reasons.append(f'FNG deteriorating {fng_momentum} in 7d')
-    
-    # 2. News sentiment (weight: 1.5x)
+
+    # 2. News/community sentiment (weight: 1.5x)
     if cp_sentiment > 0.5:
         intel_score += 2
-        reasons.append(f'Bullish news flow ({cp_sentiment:.1f})')
+        reasons.append(f'Bullish sentiment ({cp_sentiment:.1f})')
     elif cp_sentiment > 0.2:
         intel_score += 1
-        reasons.append(f'Mildly bullish news ({cp_sentiment:.1f})')
+        reasons.append(f'Mildly bullish sentiment ({cp_sentiment:.1f})')
     elif cp_sentiment < -0.5:
         intel_score -= 2
-        reasons.append(f'Bearish news flow ({cp_sentiment:.1f})')
+        reasons.append(f'Bearish sentiment ({cp_sentiment:.1f})')
     elif cp_sentiment < -0.2:
         intel_score -= 1
-        reasons.append(f'Mildly bearish news ({cp_sentiment:.1f})')
-    
+        reasons.append(f'Mildly bearish sentiment ({cp_sentiment:.1f})')
+
     # 3. Market cap momentum
     if mcap_change > 2:
         intel_score += 1
@@ -220,7 +247,7 @@ def build_market_intelligence(symbol):
     elif mcap_change < -3:
         intel_score -= 1
         reasons.append(f'Total mcap down {mcap_change:.1f}%')
-    
+
     # 4. Price momentum (multi-timeframe)
     if price_24h > 3 and price_7d > 5:
         intel_score += 2
@@ -234,7 +261,7 @@ def build_market_intelligence(symbol):
     elif price_24h < -2:
         intel_score -= 1
         reasons.append(f'{symbol} down {price_24h:.1f}% 24h')
-    
+
     # 5. Trend alignment (30d context)
     if price_30d > 15 and price_7d > 0:
         intel_score += 1
@@ -242,12 +269,12 @@ def build_market_intelligence(symbol):
     elif price_30d < -20:
         intel_score -= 1
         reasons.append(f'Downtrend: 30d={price_30d:.0f}%')
-    
+
     # --- Normalize confidence ---
     max_possible = 8
     intel_confidence = intel_score / max_possible
     intel_confidence = max(-1.0, min(1.0, intel_confidence))
-    
+
     summary = {
         'score': intel_score,
         'confidence': round(intel_confidence, 4),
