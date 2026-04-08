@@ -2,6 +2,8 @@
 Allocation Engine - Institutional-grade portfolio allocation.
 Volatility targeting, regime-aware allocation, and risk budgeting.
 BlackRock/JPM-style systematic allocation framework.
+
+Categories aligned with universe.py: equity, fixed_income, commodity, crypto
 """
 import numpy as np
 from datetime import datetime, timedelta
@@ -10,39 +12,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Strategic Asset Allocation (SAA) - base weights by asset class
+# Categories match universe.py: equity, fixed_income, commodity, crypto
 STRATEGIC_WEIGHTS = {
-    'crypto_major': 0.30,
-    'crypto_alt': 0.15,
-    'equity_us': 0.20,
-    'equity_intl': 0.10,
+    'equity': 0.30,
     'fixed_income': 0.15,
-    'commodities': 0.10,
+    'commodity': 0.15,
+    'crypto': 0.40,
 }
 
 # Regime multipliers for tactical overlay
 REGIME_MULTIPLIERS = {
     'uptrend': {
-        'crypto_major': 1.3, 'crypto_alt': 1.4, 'equity_us': 1.2,
-        'equity_intl': 1.1, 'fixed_income': 0.5, 'commodities': 1.0,
+        'equity': 1.2, 'fixed_income': 0.5, 'commodity': 1.0, 'crypto': 1.3,
     },
     'sideways': {
-        'crypto_major': 0.8, 'crypto_alt': 0.5, 'equity_us': 0.9,
-        'equity_intl': 0.8, 'fixed_income': 1.3, 'commodities': 1.0,
+        'equity': 0.9, 'fixed_income': 1.3, 'commodity': 1.0, 'crypto': 0.7,
     },
     'stress': {
-        'crypto_major': 0.3, 'crypto_alt': 0.1, 'equity_us': 0.5,
-        'equity_intl': 0.4, 'fixed_income': 1.8, 'commodities': 1.2,
+        'equity': 0.5, 'fixed_income': 1.8, 'commodity': 1.2, 'crypto': 0.2,
     },
 }
 
 # Max allocation per asset class (hard limits)
 MAX_CLASS_ALLOCATION = {
-    'crypto_major': 0.40,
-    'crypto_alt': 0.20,
-    'equity_us': 0.35,
-    'equity_intl': 0.20,
+    'equity': 0.40,
     'fixed_income': 0.40,
-    'commodities': 0.20,
+    'commodity': 0.20,
+    'crypto': 0.50,
 }
 
 # Max single position size
@@ -86,7 +82,8 @@ class AllocationEngine:
             tactical_weights = {k: v / total_tactical for k, v in tactical_weights.items()}
 
         # Step 3: Get momentum-eligible symbols per asset class
-        eligible = momentum_engine.get_top_n() if momentum_engine else {}
+        # Uses get_top_n_per_class() which returns {asset_class: [symbols]}
+        eligible = momentum_engine.get_top_n_per_class() if momentum_engine else {}
 
         # Step 4: Volatility targeting - scale total exposure
         vol_scalar = self._compute_vol_scalar(price_data)
@@ -105,7 +102,7 @@ class AllocationEngine:
             if not class_symbols:
                 continue
 
-            # Equal weight within class (can be enhanced with momentum ranking)
+            # Equal weight within class
             n_symbols = len(class_symbols)
             per_symbol = adjusted_weight / n_symbols
 
@@ -139,13 +136,13 @@ class AllocationEngine:
             f"Allocation result: {len(allocations)} positions | "
             f"invested={1-cash_pct:.1%} | cash={cash_pct:.1%} | vol_scalar={vol_scalar:.2f}"
         )
-
         return allocations
 
     def _compute_vol_scalar(self, price_data, lookback=30):
         """
         Compute portfolio volatility scalar.
-        If realized vol > target, scale down. If < target, scale up (max 1.0).
+        If realized vol > target, scale down.
+        If < target, scale up (max 1.0).
         """
         if not price_data or len(price_data) < 5:
             return 0.5  # Conservative default
@@ -169,7 +166,6 @@ class AllocationEngine:
                     return max(0.2, min(scalar, self.max_leverage))
 
             return 0.7  # Moderate default if no data
-
         except Exception as e:
             logger.warning(f"Vol scalar calculation failed: {e}")
             return 0.5
@@ -177,7 +173,7 @@ class AllocationEngine:
     def compute_rebalance_trades(self, current_positions, target_allocations, portfolio_value):
         """
         Compute trades needed to move from current to target allocations.
-        Returns list of (symbol, action, notional_amount, shares_approx).
+        Returns list of (symbol, action, notional_amount).
         """
         trades = []
 
