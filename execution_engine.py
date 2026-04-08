@@ -5,7 +5,7 @@ Integrates with AllocationEngine for target-based execution.
 """
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ class ExecutionEngine:
                     pos = self.client.get_open_position(sym)
                     available = float(pos.qty)
                     qty = min(qty, available)
-                except:
+                except Exception:
                     return {'symbol': symbol, 'status': 'error', 'reason': 'no_position'}
 
             req = MarketOrderRequest(
@@ -109,7 +109,7 @@ class ExecutionEngine:
                 'qty': round(qty, 6),
                 'notional': round(notional, 2),
                 'order_id': str(order.id),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
 
             self.execution_log.append(result)
