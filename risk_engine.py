@@ -11,7 +11,7 @@ Manages:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class RiskEngine:
 
     def reset_daily(self):
         """Reset daily counters. Call at start of each trading day."""
-        today = datetime.utcnow().strftime('%Y-%m-%d')
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         if self.last_trade_date != today:
             self.trades_today = 0
             self.daily_pnl = 0.0
@@ -183,7 +183,7 @@ class RiskEngine:
             self.daily_pnl += pnl_pct
             self.weekly_pnl += pnl_pct
         self.trade_log.append({
-            'ts': datetime.utcnow().isoformat(),
+            'ts': datetime.now(timezone.utc).isoformat(),
             'symbol': symbol or 'unknown',
             'side': side or 'unknown',
             'pnl_pct': pnl_pct,
