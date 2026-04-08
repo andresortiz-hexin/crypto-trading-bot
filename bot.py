@@ -465,7 +465,7 @@ def trade_cycle():
             log.error(f'{sym}: {e}')
 
     # Trade stock symbols (only during market hours)
-    hour = datetime.now(timezone.utc)().hour
+    hour = datetime.now(timezone.utc).hour
     if 14 <= hour <= 20:  # ~9:30 AM - 4 PM ET
         for sym in STOCK_SYMBOLS:
             try:
