@@ -13,7 +13,8 @@ import os
 import time
 import logging
 import requests
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -153,7 +154,7 @@ def get_position_qty(symbol):
     try:
         pos = trade_client.get_open_position(sym)
         return float(pos.qty)
-    except:
+    except Exception:
         return 0.0
 
 def get_position_pnl(symbol):
@@ -162,7 +163,7 @@ def get_position_pnl(symbol):
     try:
         pos = trade_client.get_open_position(sym)
         return float(pos.unrealized_plpc)
-    except:
+    except Exception:
         return 0.0
 
 def place_order(symbol, side, qty):
@@ -353,7 +354,7 @@ def trade_symbol(symbol, is_crypto, portfolio):
     positions = []
     try:
         positions = trade_client.get_all_positions()
-    except:
+    except Exception:
         pass
 
     traded = False
@@ -464,7 +465,7 @@ def trade_cycle():
             log.error(f'{sym}: {e}')
 
     # Trade stock symbols (only during market hours)
-    hour = datetime.utcnow().hour
+    hour = datetime.now(timezone.utc)().hour
     if 14 <= hour <= 20:  # ~9:30 AM - 4 PM ET
         for sym in STOCK_SYMBOLS:
             try:
@@ -541,6 +542,40 @@ def run_v3_rebalance():
         log.info(msg.replace('<b>', '').replace('</b>', ''))
     except Exception as e:
         log.error(f'V3 rebalance error: {e}')
+# === HEALTH MONITORING ===
+HEARTBEAT_FILE = '/tmp/bot_heartbeat'
+HEALTH_FILE = '/tmp/bot_health.json'
+_consecutive_errors = 0
+
+def write_heartbeat():
+    """Write heartbeat for health monitor."""
+    global _consecutive_errors
+    try:
+        with open(HEARTBEAT_FILE, 'w') as f:
+            f.write(str(time.time()))
+        health = {
+            'timestamp': time.time(),
+            'cycle': cycle_count,
+            'consecutive_errors': _consecutive_errors,
+            'regime': regime_engine.current_regime,
+        }
+        try:
+            health['portfolio'] = get_portfolio_value()
+            health['pnl'] = get_daily_pnl_pct()
+        except Exception:
+            pass
+        with open(HEALTH_FILE, 'w') as f:
+            json.dump(health, f)
+        _consecutive_errors = 0
+    except Exception as e:
+        log.debug(f'Heartbeat write error: {e}')
+
+def record_error():
+    """Record an error for health monitoring."""
+    global _consecutive_errors
+    _consecutive_errors += 1
+
+
 
 def main():
     log.info('=== V3 INSTITUTIONAL Trading Bot Started ===')
@@ -555,8 +590,10 @@ def main():
     while True:
         try:
             trade_cycle()
+            write_heartbeat()
         except Exception as e:
             log.error(f'Main loop: {e}')
+            record_error()
             send_telegram(f'<b>ERROR</b>: {e}')
         time.sleep(TRADE_INTERVAL)
 
