@@ -491,7 +491,7 @@ def run_v3_rebalance():
         all_symbols = get_tradeable_symbols()
         for sym_info in all_symbols:
             sym = sym_info['symbol']
-            is_crypto = sym_info.get('asset_class', '') in ['crypto_major', 'crypto_alt']
+            is_crypto = sym_info.get('asset_class', '') in ['crypto']
             try:
                 bars = get_bars(sym, is_crypto, TimeFrame.Day, 60)
                 if bars is not None and len(bars) >= 20:
@@ -501,7 +501,11 @@ def run_v3_rebalance():
         if len(price_data) < 3:
             log.warning('V3: Insufficient price data for rebalance')
             return
-        momentum_engine.compute(price_data)
+                # Convert price lists to DataFrames for momentum engine
+        bars_data = {}
+        for sym, closes in price_data.items():
+            bars_data[sym] = pd.DataFrame({'close': closes})
+        momentum_engine.compute_all(bars_data)
         allocations = allocation_engine.compute_allocations(
             regime=regime, momentum_engine=momentum_engine,
             price_data=price_data, portfolio_value=portfolio,
