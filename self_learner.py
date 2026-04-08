@@ -10,7 +10,7 @@ import json
 import logging
 import requests
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ class SelfLearner:
     def record_trade(self, symbol, side, qty, price, pnl_pct=None):
         """Record a trade for analytics."""
         trade = {
-            'ts': datetime.utcnow().isoformat(),
+            'ts': datetime.now(timezone.utc).isoformat(),
             'symbol': symbol,
             'side': side,
             'qty': qty,
@@ -126,7 +126,7 @@ class SelfLearner:
     def record_daily_return(self, pnl_pct, portfolio_value):
         """Record daily return for Sharpe calculation."""
         self.daily_returns.append({
-            'date': datetime.utcnow().strftime('%Y-%m-%d'),
+            'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
             'pnl': pnl_pct,
             'portfolio': portfolio_value,
             'regime': self.regime,
