@@ -23,12 +23,12 @@ STRESS = 'stress'
 class RegimeEngine:
     """
     Institutional-grade market regime classifier.
-    
+
     Uses QQQ/SPY daily data to determine market state:
     - UPTREND: Price above EMA, positive slope, moderate volatility
     - SIDEWAYS: Price near EMA, flat slope, normal volatility
     - STRESS: Price below EMA, high volatility, significant drawdown
-    
+
     Regime determines which assets are tradeable and signal thresholds.
     """
 
@@ -40,36 +40,36 @@ class RegimeEngine:
         # Regime-specific rules
         self.regime_rules = {
             UPTREND: {
-                'allowed_assets': ['QQQ', 'SPY', 'TQQQ', 'BTC/USD'],
+                'allowed_assets': ['QQQ', 'SPY', 'TQQQ', 'BTC/USD', 'ETH/USD', 'SOL/USD'],
                 'max_leveraged_pct': 0.15,
-                'min_signal_score': 55,
-                'max_trades_per_day': 6,
+                'min_signal_score': 40,
+                'max_trades_per_day': 8,
                 'description': 'Trend favorable - tactical leverage allowed'
             },
             SIDEWAYS: {
-                'allowed_assets': ['QQQ', 'SPY', 'BTC/USD'],
+                'allowed_assets': ['QQQ', 'SPY', 'BTC/USD', 'ETH/USD', 'SOL/USD'],
                 'max_leveraged_pct': 0.0,
-                'min_signal_score': 65,
-                'max_trades_per_day': 4,
-                'description': 'Range market - conservative mode, no leverage'
+                'min_signal_score': 35,
+                'max_trades_per_day': 6,
+                'description': 'Range market - moderate mode, diversified crypto'
             },
             STRESS: {
-                'allowed_assets': ['SPY'],
+                'allowed_assets': ['SPY', 'BTC/USD', 'ETH/USD'],
                 'max_leveraged_pct': 0.0,
-                'min_signal_score': 80,
-                'max_trades_per_day': 2,
-                'description': 'High risk - minimal exposure, cash preferred'
+                'min_signal_score': 50,
+                'max_trades_per_day': 3,
+                'description': 'High risk - reduced exposure, defensive assets only'
             }
         }
 
     def classify(self, bars_daily, symbol='QQQ'):
         """
         Classify market regime using daily bars of underlying index.
-        
+
         Args:
             bars_daily: DataFrame with OHLCV daily data (min 100 bars)
             symbol: Index symbol used for classification
-            
+
         Returns:
             str: Current regime (UPTREND, SIDEWAYS, STRESS)
         """
@@ -118,14 +118,12 @@ class RegimeEngine:
             # Classification logic
             old_regime = self.current_regime
 
-            if (above_ema50 and ema_slope > 0.005 and 
-                atr_ratio < 1.5 and drawdown > -0.05):
+            if (above_ema50 and ema_slope > 0.005 and
+                    atr_ratio < 1.5 and drawdown > -0.05):
                 self.current_regime = UPTREND
-
-            elif (drawdown < -0.08 or atr_ratio > 1.8 or 
+            elif (drawdown < -0.08 or atr_ratio > 1.8 or
                   (not above_ema50 and ema_slope < -0.01)):
                 self.current_regime = STRESS
-
             else:
                 self.current_regime = SIDEWAYS
 
@@ -167,7 +165,7 @@ class RegimeEngine:
     def get_min_signal_score(self):
         """Get minimum signal score required for current regime."""
         rules = self.regime_rules.get(self.current_regime, {})
-        return rules.get('min_signal_score', 65)
+        return rules.get('min_signal_score', 35)
 
     def get_max_leveraged_pct(self):
         """Get maximum portfolio % allowed in leveraged ETFs."""
@@ -187,7 +185,7 @@ class RegimeEngine:
             'regime': self.current_regime,
             'description': rules.get('description', ''),
             'allowed_assets': rules.get('allowed_assets', []),
-            'min_signal_score': rules.get('min_signal_score', 65),
+            'min_signal_score': rules.get('min_signal_score', 35),
             'max_leveraged_pct': rules.get('max_leveraged_pct', 0.0),
             'max_trades_per_day': rules.get('max_trades_per_day', 4),
             'last_metrics': last,
