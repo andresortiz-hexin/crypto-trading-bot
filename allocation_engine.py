@@ -6,7 +6,7 @@ BlackRock/JPM-style systematic allocation framework.
 Categories aligned with universe.py: equity, fixed_income, commodity, crypto
 """
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ class AllocationEngine:
 
         self.current_allocations = allocations
         self.allocation_history.append({
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'regime': regime,
             'vol_scalar': round(vol_scalar, 3),
             'total_invested': round(1 - cash_pct, 4),
