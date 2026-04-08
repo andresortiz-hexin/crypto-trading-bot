@@ -29,7 +29,7 @@ BEARISH_KEYWORDS = {
 
 # --- Sentiment cache with TTL ---
 _sentiment_cache = {}
-CACHE_TTL = 180  # 3 minutes
+CACHE_TTL = 600  # 10 minutes to avoid CoinGecko 429 rate limits
 
 
 def _cached_get(url, timeout=8, headers=None):
