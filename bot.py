@@ -173,7 +173,7 @@ def place_order(symbol, side, qty):
             symbol=sym,
             qty=round(qty, 6),
             side=side,
-            time_in_force=TimeInForce.GTC
+            time_in_force=TimeInForce.DAY if '/' not in symbol else TimeInForce.GTC
         )
         order = trade_client.submit_order(req)
         log.info(f'ORDER {side.value.upper()} {round(qty, 4)} {sym} id={order.id}')
