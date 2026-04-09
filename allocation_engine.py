@@ -4,6 +4,7 @@ Volatility targeting, regime-aware allocation, and risk budgeting.
 BlackRock/JPM-style systematic allocation framework.
 
 Categories aligned with universe.py: equity, fixed_income, commodity, crypto
+Aligned with Hexin Systematic Global Allocation Strategy v1 document.
 """
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -12,44 +13,51 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Strategic Asset Allocation (SAA) - base weights by asset class
-# Categories match universe.py: equity, fixed_income, commodity, crypto
+# Per strategy doc: Equity 40%, Fixed Income 20%, Commodity 15%, Crypto 15%
 STRATEGIC_WEIGHTS = {
-    'equity': 0.30,
-    'fixed_income': 0.15,
+    'equity': 0.40,
+    'fixed_income': 0.20,
     'commodity': 0.15,
-    'crypto': 0.40,
+    'crypto': 0.15,
 }
 
 # Regime multipliers for tactical overlay
+# Per strategy doc section 3.3:
+# Risk-On: equity 100%, crypto 100%, bonds 80%, gold 100%
+# Neutral: equity 70%, crypto 50%, bonds 100%, gold 120%
+# Risk-Off: equity 40%, crypto 0%, bonds 120%, gold 150%
 REGIME_MULTIPLIERS = {
     'uptrend': {
-        'equity': 1.2, 'fixed_income': 0.5, 'commodity': 1.0, 'crypto': 1.3,
+        'equity': 1.0, 'fixed_income': 0.8, 'commodity': 1.0, 'crypto': 1.0,
     },
     'sideways': {
-        'equity': 0.9, 'fixed_income': 1.3, 'commodity': 1.0, 'crypto': 0.7,
+        'equity': 0.7, 'fixed_income': 1.0, 'commodity': 1.2, 'crypto': 0.5,
     },
     'stress': {
-        'equity': 0.5, 'fixed_income': 1.8, 'commodity': 1.2, 'crypto': 0.2,
+        'equity': 0.4, 'fixed_income': 1.2, 'commodity': 1.5, 'crypto': 0.0,
     },
 }
 
-# Max allocation per asset class (hard limits)
+# Max allocation per asset class (hard limits) - per strategy doc section 5.2
 MAX_CLASS_ALLOCATION = {
-    'equity': 0.40,
-    'fixed_income': 0.40,
+    'equity': 0.50,
+    'fixed_income': 0.30,
     'commodity': 0.20,
-    'crypto': 0.50,
+    'crypto': 0.20,
 }
 
-# Max single position size
+# Max single position size - per strategy doc section 5.1
 MAX_SINGLE_POSITION = 0.15
+MAX_SINGLE_CRYPTO = 0.08
+MAX_SINGLE_COMMODITY = 0.10
 MIN_POSITION_SIZE = 0.02
+MIN_CASH = 0.10  # Always maintain 10% cash buffer
 
 
 class AllocationEngine:
     """Institutional allocation engine with volatility targeting and regime overlay."""
 
-    def __init__(self, target_volatility=0.12, max_leverage=1.0, risk_free_rate=0.05):
+    def __init__(self, target_volatility=0.10, max_leverage=1.0, risk_free_rate=0.05):
         self.target_vol = target_volatility
         self.max_leverage = max_leverage
         self.risk_free_rate = risk_free_rate
@@ -64,6 +72,7 @@ class AllocationEngine:
         3. Momentum signal filtering
         4. Volatility targeting
         5. Position sizing with risk budget
+        6. Enforce hard limits (class caps, min cash)
         """
         logger.info(f"Computing allocations | regime={regime} | portfolio=${portfolio_value:,.2f}")
 
@@ -82,7 +91,6 @@ class AllocationEngine:
             tactical_weights = {k: v / total_tactical for k, v in tactical_weights.items()}
 
         # Step 3: Get momentum-eligible symbols per asset class
-        # Uses get_top_n_per_class() which returns {asset_class: [symbols]}
         eligible = momentum_engine.get_top_n_per_class() if momentum_engine else {}
 
         # Step 4: Volatility targeting - scale total exposure
@@ -90,6 +98,7 @@ class AllocationEngine:
 
         # Step 5: Build final allocations
         allocations = {}
+
         for ac, class_weight in tactical_weights.items():
             # Apply vol scalar and cap at max class allocation
             adjusted_weight = min(
@@ -107,10 +116,24 @@ class AllocationEngine:
             per_symbol = adjusted_weight / n_symbols
 
             for symbol in class_symbols:
-                # Cap individual position
-                position_size = min(per_symbol, MAX_SINGLE_POSITION)
+                # Cap individual position based on asset type
+                if ac == 'crypto':
+                    max_pos = MAX_SINGLE_CRYPTO
+                elif ac == 'commodity':
+                    max_pos = MAX_SINGLE_COMMODITY
+                else:
+                    max_pos = MAX_SINGLE_POSITION
+
+                position_size = min(per_symbol, max_pos)
                 if position_size >= MIN_POSITION_SIZE:
                     allocations[symbol] = round(position_size, 4)
+
+        # Step 6: Enforce minimum cash buffer
+        total_alloc = sum(allocations.values())
+        max_invested = 1.0 - MIN_CASH  # 90% max invested
+        if total_alloc > max_invested:
+            scale = max_invested / total_alloc
+            allocations = {k: round(v * scale, 4) for k, v in allocations.items()}
 
         # Ensure total doesn't exceed max leverage
         total_alloc = sum(allocations.values())
@@ -119,9 +142,17 @@ class AllocationEngine:
             allocations = {k: round(v * scale, 4) for k, v in allocations.items()}
 
         # Calculate cash position
-        cash_pct = max(0, 1.0 - sum(allocations.values()))
+        cash_pct = max(MIN_CASH, 1.0 - sum(allocations.values()))
+
+        # Apply regime cash floor
+        regime_floor = self.get_regime_cash_floor(regime)
+        if cash_pct < regime_floor:
+            scale = (1.0 - regime_floor) / sum(allocations.values()) if sum(allocations.values()) > 0 else 0
+            allocations = {k: round(v * scale, 4) for k, v in allocations.items()}
+            cash_pct = max(regime_floor, 1.0 - sum(allocations.values()))
 
         self.current_allocations = allocations
+
         self.allocation_history.append({
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'regime': regime,
@@ -136,30 +167,30 @@ class AllocationEngine:
             f"Allocation result: {len(allocations)} positions | "
             f"invested={1-cash_pct:.1%} | cash={cash_pct:.1%} | vol_scalar={vol_scalar:.2f}"
         )
+
         return allocations
 
     def _compute_vol_scalar(self, price_data, lookback=30):
         """
         Compute portfolio volatility scalar.
-        If realized vol > target, scale down.
-        If < target, scale up (max 1.0).
+        Target vol = 10% annualized (per strategy doc section 4.1/6).
+        If realized vol > target, scale down. If < target, scale up (max 1.0).
         """
         if not price_data or len(price_data) < 5:
             return 0.5  # Conservative default
 
         try:
-            # Use BTC as proxy for overall market vol
-            btc_key = None
-            for key in ['BTCUSD', 'BTC/USD', 'BTC']:
+            # Use SPY as proxy for overall market vol (more stable than BTC)
+            spy_key = None
+            for key in ['SPY', 'BTC/USD', 'BTCUSD', 'BTC']:
                 if key in price_data:
-                    btc_key = key
+                    spy_key = key
                     break
 
-            if btc_key and len(price_data[btc_key]) >= lookback:
-                prices = price_data[btc_key][-lookback:]
+            if spy_key and len(price_data[spy_key]) >= lookback:
+                prices = price_data[spy_key][-lookback:]
                 returns = np.diff(np.log(prices))
                 realized_vol = np.std(returns) * np.sqrt(252)
-
                 if realized_vol > 0:
                     scalar = self.target_vol / realized_vol
                     # Clamp between 0.2 and 1.0 (never leverage)
@@ -211,9 +242,9 @@ class AllocationEngine:
         return trades
 
     def get_regime_cash_floor(self, regime):
-        """Minimum cash percentage by regime."""
+        """Minimum cash percentage by regime. Per strategy doc: 10% min, more in stress."""
         floors = {
-            'uptrend': 0.05,
+            'uptrend': 0.10,
             'sideways': 0.20,
             'stress': 0.40,
         }
