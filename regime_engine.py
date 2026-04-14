@@ -40,24 +40,24 @@ class RegimeEngine:
         # Regime-specific rules
         self.regime_rules = {
             UPTREND: {
-                'allowed_assets': ['QQQ', 'SPY', 'TQQQ', 'BTC/USD', 'ETH/USD', 'SOL/USD'],
+                                'allowed_assets': ['QQQ', 'SPY', 'TQQQ', 'IWM', 'XLK', 'BTC/USD', 'ETH/USD', 'SOL/USD', 'GLD'],
                 'max_leveraged_pct': 0.15,
-                'min_signal_score': 40,
-                'max_trades_per_day': 8,
+                                'min_signal_score': 30,
+                                'max_trades_per_day': 15,
                 'description': 'Trend favorable - tactical leverage allowed'
             },
             SIDEWAYS: {
-                'allowed_assets': ['QQQ', 'SPY', 'BTC/USD', 'ETH/USD', 'SOL/USD'],
+                                'allowed_assets': ['QQQ', 'SPY', 'TQQQ', 'IWM', 'BTC/USD', 'ETH/USD', 'SOL/USD', 'XLK'],
                 'max_leveraged_pct': 0.0,
-                'min_signal_score': 35,
-                'max_trades_per_day': 6,
+                                'min_signal_score': 25,
+                                'max_trades_per_day': 10,
                 'description': 'Range market - moderate mode, diversified crypto'
             },
             STRESS: {
-                'allowed_assets': ['SPY', 'BTC/USD', 'ETH/USD'],
+                                'allowed_assets': ['SPY', 'QQQ', 'BTC/USD', 'ETH/USD', 'GLD'],
                 'max_leveraged_pct': 0.0,
-                'min_signal_score': 50,
-                'max_trades_per_day': 3,
+                                'min_signal_score': 35,
+                                'max_trades_per_day': 6,
                 'description': 'High risk - reduced exposure, defensive assets only'
             }
         }
