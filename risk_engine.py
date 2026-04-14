@@ -29,22 +29,22 @@ class RiskEngine:
 
     def __init__(self, **kwargs):
         # Per-trade risk
-        self.max_risk_per_trade_pct = kwargs.get('max_risk_per_trade_pct', 0.005)  # 0.5% of NAV
+                self.max_risk_per_trade_pct = kwargs.get('max_risk_per_trade_pct', 0.01)  # 1% of NAV
 
         # Per-instrument limits
-        self.max_position_pct_core = kwargs.get('max_position_pct', 0.20)      # 20% for QQQ/SPY
-        self.max_position_pct_tactical = kwargs.get('max_position_pct_tactical', 0.10)  # 10% for TQQQ
-        self.max_position_pct_crypto = kwargs.get('max_position_pct_crypto', 0.15)  # 15% for BTC/USD
+                self.max_position_pct_core = kwargs.get('max_position_pct', 0.25)      # 25% for QQQ/SPY
+                self.max_position_pct_tactical = kwargs.get('max_position_pct_tactical', 0.15)  # 15% for TQQQ
+                self.max_position_pct_crypto = kwargs.get('max_position_pct_crypto', 0.20)  # 20% for BTC/USD
 
         # Aggregate limits
-        self.max_total_exposure_pct = kwargs.get('max_portfolio_exposure', 0.70)  # 70% max invested
-        self.max_leveraged_exposure_pct = kwargs.get('max_leveraged_exposure_pct', 0.15)
-        self.max_crypto_exposure_pct = kwargs.get('max_crypto_exposure_pct', 0.25)
+                self.max_total_exposure_pct = kwargs.get('max_portfolio_exposure', 0.90)  # 90% max invested
+                self.max_leveraged_exposure_pct = kwargs.get('max_leveraged_exposure_pct', 0.20)
+                self.max_crypto_exposure_pct = kwargs.get('max_crypto_exposure_pct', 0.35)
         self.max_correlated_exposure = kwargs.get('max_correlated_exposure', 0.40)
 
         # Daily/weekly loss limits
-        self.daily_loss_limit_pct = -abs(kwargs.get('daily_loss_limit_pct', 0.015))  # -1.5% daily
-        self.weekly_loss_limit_pct = -abs(kwargs.get('weekly_loss_limit_pct', 0.04))  # -4% weekly
+                self.daily_loss_limit_pct = -abs(kwargs.get('daily_loss_limit_pct', 0.025))  # -2.5% daily
+                self.weekly_loss_limit_pct = -abs(kwargs.get('weekly_loss_limit_pct', 0.06))  # -6% weekly
 
         # Trade frequency
         self.max_trades_per_day = kwargs.get('max_trades_per_day', 6)
@@ -143,15 +143,15 @@ class RiskEngine:
 
         # Reduce in high volatility
         if volatility > 0.03:
-            size_pct *= 0.5
+                        size_pct *= 0.7
         elif volatility > 0.02:
-            size_pct *= 0.7
+                        size_pct *= 0.85
 
         # Regime adjustment
         if regime in ('stress', 'bear'):
-            size_pct *= 0.3
+                        size_pct *= 0.5
         elif regime == 'sideways':
-            size_pct *= 0.6
+                        size_pct *= 0.8
 
         # Never exceed risk per trade
         size_pct = min(size_pct, self.max_risk_per_trade_pct * 20)  # Cap at 10% max
