@@ -18,8 +18,9 @@ log = logging.getLogger(__name__)
 
 # Lookback weights for composite momentum
 LOOKBACK_WEIGHTS = {
-    21: 0.40,    # 1 month (~21 trading days)
-    63: 0.30,    # 3 months
+        21: 0.35,    # 1 month (~21 trading days)
+        5: 0.15,     # 1 week (5 trading days) - short-term reactivity
+        63: 0.20,    # 3 months
     126: 0.20,   # 6 months
     252: 0.10,   # 12 months
 }
@@ -148,7 +149,7 @@ class MomentumEngine:
             # Only include positive momentum
             positive = [(s, sc) for s, sc in ranked if self.abs_signals.get(s, False)]
             if n is None:
-                count = max(1, len(positive) // 2)  # top 50%
+                                count = max(1, int(len(positive) * 0.75))  # top 75%
             else:
                 count = n
             result[ac] = [s for s, _ in positive[:count]]
