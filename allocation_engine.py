@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 # Per strategy doc: Equity 40%, Fixed Income 20%, Commodity 15%, Crypto 15%
 STRATEGIC_WEIGHTS = {
     'equity': 0.40,
-    'fixed_income': 0.20,
+        'fixed_income': 0.15,
     'commodity': 0.15,
-    'crypto': 0.15,
+        'crypto': 0.20,
 }
 
 # Regime multipliers for tactical overlay
@@ -31,27 +31,27 @@ REGIME_MULTIPLIERS = {
         'equity': 1.0, 'fixed_income': 0.8, 'commodity': 1.0, 'crypto': 1.0,
     },
     'sideways': {
-        'equity': 0.7, 'fixed_income': 1.0, 'commodity': 1.2, 'crypto': 0.5,
+                'equity': 0.85, 'fixed_income': 1.0, 'commodity': 1.2, 'crypto': 0.8,
     },
     'stress': {
-        'equity': 0.4, 'fixed_income': 1.2, 'commodity': 1.5, 'crypto': 0.0,
+                'equity': 0.6, 'fixed_income': 1.2, 'commodity': 1.5, 'crypto': 0.3,
     },
 }
 
 # Max allocation per asset class (hard limits) - per strategy doc section 5.2
 MAX_CLASS_ALLOCATION = {
-    'equity': 0.50,
+        'equity': 0.60,
     'fixed_income': 0.30,
     'commodity': 0.20,
-    'crypto': 0.20,
+        'crypto': 0.30,
 }
 
 # Max single position size - per strategy doc section 5.1
-MAX_SINGLE_POSITION = 0.15
-MAX_SINGLE_CRYPTO = 0.08
+MAX_SINGLE_POSITION = 0.20
+MAX_SINGLE_CRYPTO = 0.12
 MAX_SINGLE_COMMODITY = 0.10
 MIN_POSITION_SIZE = 0.02
-MIN_CASH = 0.10  # Always maintain 10% cash buffer
+MIN_CASH = 0.05  # Always maintain 5% cash buffer
 
 
 class AllocationEngine:
@@ -244,13 +244,13 @@ class AllocationEngine:
     def get_regime_cash_floor(self, regime):
         """Minimum cash percentage by regime. Per strategy doc: 10% min, more in stress."""
         floors = {
-            'uptrend': 0.10,
-            'sideways': 0.20,
-            'stress': 0.40,
+                        'uptrend': 0.05,
+                        'sideways': 0.10,
+                        'stress': 0.25,
         }
         return floors.get(regime, 0.25)
 
-    def should_rebalance(self, current_positions, portfolio_value, threshold=0.05):
+        def should_rebalance(self, current_positions, portfolio_value, threshold=0.03):
         """
         Check if rebalance is needed based on drift from target.
         Uses 5% absolute drift threshold (institutional standard).
