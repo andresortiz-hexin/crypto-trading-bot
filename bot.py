@@ -48,15 +48,15 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 # V2 CONFIG - Conservative institutional targets
-DAILY_PROFIT_TARGET = 0.008  # 0.8% daily (realistic)
-DAILY_LOSS_LIMIT = 0.015  # 1.5% max daily loss
-TRADE_INTERVAL = 90  # 90 seconds between cycles
+DAILY_PROFIT_TARGET = 0.015  # 0.8% daily (realistic)
+DAILY_LOSS_LIMIT = 0.025  # 1.5% max daily loss
+TRADE_INTERVAL = 60  # 90 seconds between cycles
 INTEL_INTERVAL = 300  # 5 min intel refresh
 LEARN_INTERVAL = 900  # 15 min learning cycle
 REGIME_INTERVAL = 600  # 10 min regime check
 
 CRYPTO_SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
-STOCK_SYMBOLS = ['SPY', 'QQQ']
+STOCK_SYMBOLS = ['SPY', 'QQQ', 'TQQQ', 'IWM']
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,11 +88,11 @@ stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 signal_engine = SignalEngine()
 regime_engine = RegimeEngine()
 risk_engine = RiskEngine(
-    max_trades_per_day=12,
+    max_trades_per_day=15,
     daily_loss_limit_pct=DAILY_LOSS_LIMIT,
-    weekly_loss_limit_pct=0.04,
+    weekly_loss_limit_pct=0.06,
     max_position_pct=0.25,
-    max_portfolio_exposure=0.70,
+    max_portfolio_exposure=0.90,
     max_correlated_exposure=0.40,
 )
 learner = SelfLearner()
@@ -107,7 +107,7 @@ allocation_engine = AllocationEngine(target_volatility=0.12, max_leverage=1.0)
 execution_engine = ExecutionEngine(trade_client, min_order_value=1.0)
 
 # V3 State
-REBALANCE_INTERVAL = 1800  # 30 min between rebalances
+REBALANCE_INTERVAL = 900  # 30 min between rebalances
 last_rebalance_time = 0
 last_learn_time = 0
 last_regime_time = 0
@@ -201,13 +201,13 @@ def check_risk_managed_stops():
             regime = regime_engine.current_regime
             if regime == 'stress':
                 stop_pct = -0.012   # Tight stop in stress
-                take_pct = 0.008
+                take_pct = 0.015
             elif regime == 'uptrend':
                 stop_pct = -0.025   # Wider stop in uptrend
-                take_pct = 0.02
+                take_pct = 0.03
             else:  # sideways
                 stop_pct = -0.018
-                take_pct = 0.012
+                take_pct = 0.02
 
             # STOP LOSS
             if pnl_pct <= stop_pct:
@@ -229,7 +229,7 @@ def check_risk_managed_stops():
                 continue
 
             # TRAILING STOP: if in profit > 0.5%, trail at 40% of gains
-            if pnl_pct > 0.005:
+            if pnl_pct > 0.01:
                 trail_stop = cost * (1 + pnl_pct * 0.6)  # Lock 60% of gains
                 if current < trail_stop:
                     log.info(f'TRAILING STOP {sym}: locked profit {pnl_pct:.2%}')
