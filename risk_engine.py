@@ -40,7 +40,7 @@ class RiskEngine:
                 self.max_total_exposure_pct = kwargs.get('max_portfolio_exposure', 0.90)  # 90% max invested
                 self.max_leveraged_exposure_pct = kwargs.get('max_leveraged_exposure_pct', 0.20)
                 self.max_crypto_exposure_pct = kwargs.get('max_crypto_exposure_pct', 0.35)
-        self.max_correlated_exposure = kwargs.get('max_correlated_exposure', 0.40)
+                self.max_correlated_exposure = kwargs.get('max_correlated_exposure', 0.40)
 
         # Daily/weekly loss limits
                 self.daily_loss_limit_pct = -abs(kwargs.get('daily_loss_limit_pct', 0.025))  # -2.5% daily
